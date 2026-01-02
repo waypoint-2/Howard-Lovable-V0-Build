@@ -8,9 +8,10 @@ import { cn } from "@/lib/utils"
 
 interface AppNavProps {
   onMenuToggle?: () => void
+  documentTitle?: string
 }
 
-export function AppNav({ onMenuToggle }: AppNavProps) {
+export function AppNav({ onMenuToggle, documentTitle = "Software License Agreement" }: AppNavProps) {
   const [fileMenuOpen, setFileMenuOpen] = useState(false)
 
   return (
@@ -26,7 +27,7 @@ export function AppNav({ onMenuToggle }: AppNavProps) {
         </button>
 
         <Link
-          href="/landing"
+          href="/home"
           className="hidden md:flex w-8 h-8 bg-foreground/90 rounded-full items-center justify-center hover:bg-foreground hover:scale-105 transition-all duration-200"
           aria-label="Back to home"
         >
@@ -50,9 +51,7 @@ export function AppNav({ onMenuToggle }: AppNavProps) {
             className="flex items-center gap-2 px-2 md:px-3 py-1.5 rounded-lg hover:bg-accent/60 transition-all duration-200"
           >
             <FileText className="w-4 h-4 text-muted-foreground/70" />
-            <span className="text-sm text-foreground/80 truncate max-w-[120px] md:max-w-[200px]">
-              Software License Agreement
-            </span>
+            <span className="text-sm text-foreground/80 truncate max-w-[120px] md:max-w-[200px]">{documentTitle}</span>
             <ChevronDown
               className={cn(
                 "w-3.5 h-3.5 text-muted-foreground/50 transition-transform duration-200",
@@ -70,10 +69,13 @@ export function AppNav({ onMenuToggle }: AppNavProps) {
                 : "opacity-0 scale-95 -translate-y-1 pointer-events-none",
             )}
           >
-            <button className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-foreground/80 hover:bg-accent/60 rounded-lg transition-colors duration-150">
+            <Link
+              href="/home"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-foreground/80 hover:bg-accent/60 rounded-lg transition-colors duration-150"
+            >
               <Upload className="w-4 h-4 text-muted-foreground/60" />
               Upload new document
-            </button>
+            </Link>
             <button className="w-full flex items-center gap-2.5 px-3 py-2 text-sm text-foreground/80 hover:bg-accent/60 rounded-lg transition-colors duration-150">
               <Download className="w-4 h-4 text-muted-foreground/60" />
               Export translations

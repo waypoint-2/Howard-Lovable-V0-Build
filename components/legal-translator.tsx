@@ -10,17 +10,32 @@ import { AppNav } from "./app-nav"
 import { MobileMultiFrame } from "./mobile-multi-frame"
 import { MobileNavDrawer } from "./mobile-nav-drawer"
 import { DocumentOverview } from "./document-overview"
-import { clauses } from "@/lib/legal-data"
+import { clauses as defaultClauses, type Clause } from "@/lib/legal-data"
 import { Menu } from "lucide-react"
 
-export function LegalTranslator() {
-  const [activeClauseId, setActiveClauseId] = useState<string | null>("clause-7")
+interface LegalTranslatorProps {
+  documentData?: {
+    clauses: Clause[]
+    filename: string
+  } | null
+}
+
+export function LegalTranslator({ documentData }: LegalTranslatorProps) {
+  const clauses = documentData?.clauses?.length ? documentData.clauses : defaultClauses
+  const documentTitle = documentData?.filename || "Software License Agreement"
+
+  const [activeClauseId, setActiveClauseId] = useState<string | null>(clauses[0]?.id || "clause-1")
   const [documentLoaded, setDocumentLoaded] = useState(true)
   const [readingMode, setReadingMode] = useState<"reading" | "overview">("reading")
-  const [reviewedClauses, setReviewedClauses] = useState<Set<string>>(
-    new Set(["clause-1", "clause-2", "clause-3", "clause-4", "clause-5", "clause-6"]),
-  )
+  const [reviewedClauses, setReviewedClauses] = useState<Set<string>>(new Set())
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+
+  useEffect(() => {
+    if (clauses.length > 0) {
+      setActiveClauseId(clauses[0].id)
+      setReviewedClauses(new Set())
+    }
+  }, [documentData])
 
   const activeClause = clauses.find((c) => c.id === activeClauseId)
   const currentIndex = clauses.findIndex((c) => c.id === activeClauseId)
@@ -42,20 +57,20 @@ export function LegalTranslator() {
         handleClauseSelect(clauses[currentIndex - 1].id)
       }
     },
-    [activeClauseId, handleClauseSelect],
+    [activeClauseId, handleClauseSelect, clauses],
   )
 
   const goToPrevious = useCallback(() => {
     if (currentIndex > 0) {
       handleClauseSelect(clauses[currentIndex - 1].id)
     }
-  }, [currentIndex, handleClauseSelect])
+  }, [currentIndex, handleClauseSelect, clauses])
 
   const goToNext = useCallback(() => {
     if (currentIndex < clauses.length - 1) {
       handleClauseSelect(clauses[currentIndex + 1].id)
     }
-  }, [currentIndex, handleClauseSelect])
+  }, [currentIndex, handleClauseSelect, clauses])
 
   useEffect(() => {
     window.addEventListener("keydown", handleKeyDown)
@@ -70,7 +85,7 @@ export function LegalTranslator() {
     <div className="flex flex-col h-[100dvh] bg-background">
       {/* Desktop Nav - hidden on mobile */}
       <div className="hidden lg:block">
-        <AppNav />
+        <AppNav documentTitle={documentTitle} />
       </div>
 
       <header className="lg:hidden sticky top-0 z-30 bg-background/95 backdrop-blur-sm border-b border-border/60">
@@ -83,7 +98,7 @@ export function LegalTranslator() {
             <Menu className="w-5 h-5 text-foreground/70" />
           </button>
           <div className="flex-1 text-center px-2">
-            <p className="font-serif text-sm text-foreground leading-tight truncate">Software License Agreement</p>
+            <p className="font-serif text-sm text-foreground leading-tight truncate">{documentTitle}</p>
             <p className="text-[10px] text-muted-foreground mt-0.5 tracking-wide">
               {reviewedClauses.size} of {clauses.length} clauses reviewed
             </p>
