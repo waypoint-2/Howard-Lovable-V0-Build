@@ -44,17 +44,6 @@ async function extractText(file: File): Promise<string> {
 
 export async function POST(request: NextRequest) {
   try {
-    const supabase = await createClient()
-
-    // Get authenticated user
-    const {
-      data: { user },
-    } = await supabase.auth.getUser()
-
-    if (!user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
-    }
-
     const formData = await request.formData()
     const file = formData.get("file") as File
 
@@ -87,32 +76,40 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Upload to Vercel Blob
+    // Upload to Vercel Blob (must be public access)
     const blob = await put(`documents/${Date.now()}-${file.name}`, file, {
-      access: "private",
+      access: "public",
     })
 
-    // Save document to Supabase
-    const { data: document, error: dbError } = await supabase
-      .from("documents")
-      .insert({
-        user_id: user.id,
-        filename: file.name,
-        blob_url: blob.url,
-        raw_text: rawText,
-        file_size: file.size,
-        file_type: file.type,
-        upload_status: "success",
-      })
-      .select()
-      .single()
+    // Try to save document to Supabase (optional - may not have auth)
+    let documentId = null
+    try {
+      const supabase = await createClient()
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
 
-    if (dbError) {
-      console.error("[v0] Database error:", dbError)
-      return NextResponse.json(
-        { error: "Failed to save document" },
-        { status: 500 }
-      )
+      if (user) {
+        const { data: document } = await supabase
+          .from("documents")
+          .insert({
+            user_id: user.id,
+            filename: file.name,
+            blob_url: blob.url,
+            raw_text: rawText,
+            file_size: file.size,
+            file_type: file.type,
+            upload_status: "success",
+          })
+          .select()
+          .single()
+
+        if (document) {
+          documentId = document.id
+        }
+      }
+    } catch (dbError) {
+      console.log("[v0] Could not save to database (user may not be logged in)")
     }
 
     return NextResponse.json({
@@ -120,7 +117,7 @@ export async function POST(request: NextRequest) {
       filename: file.name,
       size: file.size,
       type: file.type,
-      documentId: document.id,
+      documentId,
       text: rawText,
     })
   } catch (error) {

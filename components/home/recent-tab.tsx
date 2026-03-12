@@ -3,8 +3,7 @@
 import Link from "next/link"
 import { FileText, Clock, ArrowUpRight, Shield, AlertTriangle, CheckCircle, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { useEffect, useState } from "react"
-import { createClient } from "@/lib/supabase/client"
+import { useState } from "react"
 
 interface Document {
   id: string
@@ -25,53 +24,10 @@ const riskConfig = {
 
 export function RecentTab() {
   const [documents, setDocuments] = useState<Document[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const supabase = createClient()
-
-  useEffect(() => {
-    const fetchDocuments = async () => {
-      try {
-        const {
-          data: { user },
-        } = await supabase.auth.getUser()
-
-        if (!user) return
-
-        // Fetch recent documents with their analyses
-        const { data: docs, error } = await supabase
-          .from("documents")
-          .select(
-            `
-            id,
-            filename,
-            created_at,
-            analyses (
-              id,
-              overall_risk,
-              status,
-              clauses (id)
-            )
-          `
-          )
-          .eq("user_id", user.id)
-          .order("created_at", { ascending: false })
-          .limit(5)
-
-        if (error) {
-          console.error("[v0] Error fetching documents:", error)
-          return
-        }
-
-        setDocuments(docs || [])
-      } catch (error) {
-        console.error("[v0] Fetch error:", error)
-      } finally {
-        setIsLoading(false)
-      }
-    }
-
-    fetchDocuments()
-  }, [])
+  const [isLoading, setIsLoading] = useState(false)
+  
+  // For now, show empty state since we're not using auth
+  // Documents are analyzed on-demand and stored in sessionStorage
 
   const formatDate = (dateString: string) => {
     const date = new Date(dateString)

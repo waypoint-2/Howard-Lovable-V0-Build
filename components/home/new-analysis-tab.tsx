@@ -110,10 +110,21 @@ export function NewAnalysisTab() {
 
       const result = await analyzeResponse.json()
 
+      // Store analysis result in sessionStorage for the review page
+      sessionStorage.setItem(
+        "analyzedDocument",
+        JSON.stringify({
+          clauses: result.clauses,
+          filename: result.filename,
+          documentId: result.documentId,
+          analyzedAt: result.analyzedAt,
+        }),
+      )
+
       setUploadState("complete")
 
       // Redirect to the document review page
-      router.push(`/review/${result.analysis.id}`)
+      router.push("/review")
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong")
       setUploadState("error")
