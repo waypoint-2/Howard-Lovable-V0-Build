@@ -1,4 +1,188 @@
-import { NextResponse } from "next/server"
+import { NextResponse, type NextRequest } from "next/server"
+import { generateText, Output } from "ai"
+import { z } from "zod"
+import { createClient } from "@/lib/supabase/server"
+import { Ratelimit } from "@upstash/ratelimit"
+import { Redis } from "@upstash/redis"
+
+// Rate limiting setup
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+})
+
+const ratelimit = new Ratelimit({
+  redis: redis,
+  limiter: Ratelimit.slidingWindow(10, "1 h"), // 10 analyses per hour
+})
+
+// Schema for the analysis output
+const clauseSchema = z.object({
+  title: z.string(),
+  clauseNumber: z.string(),
+  originalText: z.string(),
+  plainMeaning: z.string(),
+  whyMatters: z.array(z.string()),
+  riskLevel: z.enum(["low", "medium", "high"]),
+  favors: z.string(),
+  questions: z.array(
+    z.object({
+      question: z.string(),
+      answer: z.string(),
+    })
+  ),
+})
+
+const analysisSchema = z.object({
+  summary: z.string(),
+  overallRisk: z.enum(["low", "medium", "high"]),
+  clauses: z.array(clauseSchema),
+})
+
+export async function POST(request: NextRequest) {
+  try {
+    const supabase = await createClient()
+
+    // Get authenticated user
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
+
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+
+    // Rate limit check
+    const { success, limit, reset, remaining } = await ratelimit.limit(
+      user.id
+    )
+
+    if (!success) {
+      const now = Date.now()
+      const resetTime = new Date(reset * 1000)
+      const minutesRemaining = Math.ceil((resetTime.getTime() - now) / 60000)
+      return NextResponse.json(
+        {
+          error: `Rate limit exceeded. Please try again in ${minutesRemaining} minutes.`,
+        },
+        { status: 429, headers: { "X-RateLimit-Reset": reset.toString() } }
+      )
+    }
+
+    const body = await request.json()
+    const { text, filename, documentId } = body
+
+    if (!text) {
+      return NextResponse.json(
+        { error: "No text provided" },
+        { status: 400 }
+      )
+    }
+
+    console.log(
+      `[v0] Analyzing document: ${filename} for user: ${user.id}`
+    )
+
+    // Create analysis record in database
+    const { data: analysis, error: createError } = await supabase
+      .from("analyses")
+      .insert({
+        user_id: user.id,
+        document_id: documentId,
+        status: "processing",
+      })
+      .select()
+      .single()
+
+    if (createError) {
+      console.error("[v0] Failed to create analysis record:", createError)
+      return NextResponse.json(
+        { error: "Failed to create analysis" },
+        { status: 500 }
+      )
+    }
+
+    // Call Claude for analysis
+    const result = await generateText({
+      model: "anthropic/claude-3-5-sonnet-20241022",
+      system: `You are an expert legal document analyst specializing in contract review and clause extraction. 
+Your task is to analyze legal documents and break them down into individual clauses with plain-language explanations.
+For each clause, identify:
+1. The clause title
+2. Plain meaning in simple language
+3. Why it matters (list of impacts/implications)
+4. Risk level (low/medium/high)
+5. Who it favors (e.g., "Company", "User", "Mutual", etc.)
+6. Common questions and answers about the clause`,
+
+      prompt: `Please analyze the following legal document and extract all clauses. For each clause provide the structured analysis. Document: ${text.substring(0, 10000)}`,
+
+      output: Output.object({
+        schema: analysisSchema,
+      }),
+    })
+
+    const analysisData = result.object as z.infer<typeof analysisSchema>
+
+    // Save clauses to database
+    const clausesData = analysisData.clauses.map((clause) => ({
+      analysis_id: analysis.id,
+      title: clause.title,
+      clause_number: clause.clauseNumber,
+      original_text: clause.originalText,
+      plain_meaning: clause.plainMeaning,
+      why_matters: clause.whyMatters,
+      risk_level: clause.riskLevel,
+      favors: clause.favors,
+      questions: clause.questions,
+    }))
+
+    const { error: clausesError } = await supabase
+      .from("clauses")
+      .insert(clausesData)
+
+    if (clausesError) {
+      console.error("[v0] Failed to save clauses:", clausesError)
+    }
+
+    // Update analysis record with results
+    const { error: updateError } = await supabase
+      .from("analyses")
+      .update({
+        status: "completed",
+        summary: analysisData.summary,
+        overall_risk: analysisData.overallRisk,
+        raw_response: JSON.stringify(analysisData),
+      })
+      .eq("id", analysis.id)
+
+    if (updateError) {
+      console.error("[v0] Failed to update analysis:", updateError)
+    }
+
+    // Increment user's analysis count
+    await supabase.rpc("increment_analysis_count", { user_id: user.id })
+
+    return NextResponse.json({
+      success: true,
+      analysis: {
+        id: analysis.id,
+        summary: analysisData.summary,
+        overallRisk: analysisData.overallRisk,
+        clauses: analysisData.clauses,
+      },
+    })
+  } catch (error) {
+    console.error("[v0] Analysis error:", error)
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Analysis failed",
+      },
+      { status: 500 }
+    )
+  }
+}
 
 function parseDocumentIntoSections(text: string, filename: string) {
   const lines = text.split("\n").filter((line) => line.trim())

@@ -54,14 +54,6 @@ export function NewAnalysisTab() {
     fileInputRef.current?.click()
   }, [])
 
-  const extractTextFromFile = async (file: File): Promise<string> => {
-    if (file.type === "text/plain" || file.name.endsWith(".txt")) {
-      return await file.text()
-    }
-    const text = await file.text()
-    return text
-  }
-
   const startAnalysis = async () => {
     if (!uploadedFile) return
 
@@ -75,7 +67,7 @@ export function NewAnalysisTab() {
         setProgress((prev) => Math.min(prev + 10, 40))
       }, 200)
 
-      // Upload file to Blob storage
+      // Upload file to Blob storage + extract text
       const formData = new FormData()
       formData.append("file", uploadedFile)
 
@@ -88,14 +80,16 @@ export function NewAnalysisTab() {
       setProgress(50)
 
       if (!uploadResponse.ok) {
-        throw new Error("Upload failed")
+        const errorData = await uploadResponse.json()
+        throw new Error(errorData.error || "Upload failed")
       }
+
+      const uploadResult = await uploadResponse.json()
+      const { text, documentId } = uploadResult
 
       setUploadState("analyzing")
 
-      // Extract text and analyze with AI
-      const text = await extractTextFromFile(uploadedFile)
-
+      // Analyze with AI
       const analysisInterval = setInterval(() => {
         setProgress((prev) => Math.min(prev + 5, 90))
       }, 300)
@@ -103,7 +97,7 @@ export function NewAnalysisTab() {
       const analyzeResponse = await fetch("/api/analyze-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, filename: uploadedFile.name }),
+        body: JSON.stringify({ text, filename: uploadedFile.name, documentId }),
       })
 
       clearInterval(analysisInterval)
@@ -116,20 +110,10 @@ export function NewAnalysisTab() {
 
       const result = await analyzeResponse.json()
 
-      sessionStorage.setItem(
-        "analyzedDocument",
-        JSON.stringify({
-          clauses: result.clauses,
-          filename: result.filename,
-          documentId: result.documentId,
-          analyzedAt: result.analyzedAt,
-        }),
-      )
-
       setUploadState("complete")
 
       // Redirect to the document review page
-      router.push("/review")
+      router.push(`/review/${result.analysis.id}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong")
       setUploadState("error")
