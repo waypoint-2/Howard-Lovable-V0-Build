@@ -1,33 +1,9 @@
 import { updateSession } from '@/lib/supabase/middleware'
-import { type NextRequest, NextResponse } from 'next/server'
+import { type NextRequest } from 'next/server'
 
 export async function middleware(request: NextRequest) {
-  const response = await updateSession(request)
-
-  // Get the pathname
-  const { pathname } = request.nextUrl
-
-  // Protected routes that require authentication
-  const protectedRoutes = ['/home', '/dashboard', '/review', '/workspace']
-  const isProtectedRoute = protectedRoutes.some((route) =>
-    pathname.startsWith(route)
-  )
-
-  // Public routes that don't require authentication
-  const publicRoutes = ['/auth', '/api', '/_next']
-  const isPublicRoute = publicRoutes.some((route) => pathname.startsWith(route))
-
-  if (!isPublicRoute && isProtectedRoute) {
-    // Check if user has a session
-    const session = response.headers.get('x-session')
-
-    if (!session) {
-      const redirectUrl = new URL('/auth/sign-up', request.url)
-      return NextResponse.redirect(redirectUrl)
-    }
-  }
-
-  return response
+  // Just update session without any auth checks - all routes are public
+  return await updateSession(request)
 }
 
 export const config = {
