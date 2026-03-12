@@ -135,7 +135,7 @@ function createClause(section: { number: string; title: string; content: string[
   const plainMeaning = generatePlainMeaning(section.title, originalText, riskLevel)
 
   // Generate why it matters
-  const whyMatters = generateWhyMatters(section.title, riskLevel)
+  const whyMatters = generateWhyMatters(section.title, riskLevel, originalText)
 
   // Extract definitions if any
   const definitions = extractDefinitions(originalText)
@@ -174,52 +174,102 @@ function createClause(section: { number: string; title: string; content: string[
 function generatePlainMeaning(title: string, text: string, riskLevel: string): string {
   const titleLower = title.toLowerCase()
   const textLower = text.toLowerCase()
-
+  
+  // Extract key information from the actual text content
+  const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 10)
+  const firstSentence = sentences[0]?.trim() || ""
+  
+  // Try to create a summary based on actual content
   if (titleLower.includes("definition") || titleLower.includes("interpret")) {
-    return "This section explains the specific meanings of key terms used throughout the document. Understanding these definitions is crucial as they affect how the entire agreement is interpreted."
+    return `This section defines key terms used in the document. ${firstSentence.length > 20 ? 'It establishes that ' + firstSentence.substring(0, 150).toLowerCase() + '...' : 'Understanding these definitions is crucial for interpreting the agreement.'}`
+  }
+  if (titleLower.includes("rent") || textLower.includes("rent") || textLower.includes("tenant")) {
+    const rentMatch = text.match(/\$[\d,]+(?:\.\d{2})?/)
+    return `This section covers rent payments and related financial obligations. ${rentMatch ? `The rent amount referenced is ${rentMatch[0]}.` : ''} It explains when and how payments should be made, and any additional charges you may be responsible for.`
+  }
+  if (titleLower.includes("deposit") || textLower.includes("deposit")) {
+    return `This section explains the security deposit requirements - how much is required, when it must be paid, and under what conditions it will be returned. Pay attention to any deductions that may be made.`
+  }
+  if (titleLower.includes("smoking") || textLower.includes("smoking") || textLower.includes("prohibited")) {
+    return `This section outlines specific rules and restrictions that apply to the property or agreement. Violating these rules could result in penalties or termination of the agreement.`
   }
   if (titleLower.includes("grant") || titleLower.includes("license")) {
-    return "This section describes what rights or permissions are being given, including any limitations on how those rights can be used."
+    return `This section describes what rights or permissions are being granted. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It specifies the scope and limitations of what you can do.'}`
   }
   if (titleLower.includes("payment") || titleLower.includes("fee") || textLower.includes("payment")) {
-    return "This section outlines the financial obligations, including amounts due, payment schedules, and any consequences for late or missed payments."
+    return `This section outlines payment obligations. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It specifies amounts due, payment schedules, and consequences for late payments.'}`
   }
   if (titleLower.includes("termination") || titleLower.includes("cancel")) {
-    return "This section explains how and when the agreement can be ended, what happens when it ends, and any obligations that continue after termination."
+    return `This section explains how the agreement can be ended. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It covers conditions for termination and what happens afterward.'}`
   }
   if (titleLower.includes("liability") || titleLower.includes("indemnif")) {
-    return "This section addresses who is responsible if something goes wrong, including limits on damages and obligations to protect the other party from claims."
+    return `This section addresses legal responsibility and liability. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It limits who is responsible if something goes wrong.'}`
   }
   if (titleLower.includes("confidential") || titleLower.includes("privacy")) {
-    return "This section covers what information must be kept private, how it can be used, and what happens if confidentiality is breached."
+    return `This section covers privacy and confidentiality requirements. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It specifies what information must be kept private.'}`
   }
   if (titleLower.includes("warrant") || titleLower.includes("guarantee")) {
-    return "This section describes what promises or guarantees are being made about the product or service, and importantly, what is NOT being guaranteed."
+    return `This section describes warranties and guarantees. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It outlines what is and is not promised.'}`
+  }
+  if (titleLower.includes("parties") || textLower.includes("landlord") || textLower.includes("lessor")) {
+    return `This section identifies who is involved in this agreement - the parties, their roles, and their contact information. These details are important for knowing who to contact and who is bound by the terms.`
+  }
+  if (titleLower.includes("property") || titleLower.includes("premises") || textLower.includes("address")) {
+    return `This section describes the property or premises covered by this agreement, including the address and any specific areas or items that are included or excluded.`
+  }
+  
+  // Default: try to use the first sentence if available
+  if (firstSentence.length > 30) {
+    return `This section covers: ${firstSentence.substring(0, 250)}${firstSentence.length > 250 ? '...' : ''}`
   }
 
   return riskLevel === "high"
     ? "This section contains important terms that significantly affect your rights and obligations. Review it carefully and consider seeking clarification on any unclear points."
-    : "This section establishes standard terms for this type of agreement. While routine, it is still important to understand what you are agreeing to."
+    : "This section establishes terms for this agreement. Review it to understand what you are agreeing to."
 }
 
-function generateWhyMatters(title: string, riskLevel: string): string[] {
-  const matters = []
-
-  if (riskLevel === "high") {
-    matters.push("Contains terms that could significantly impact your rights")
-    matters.push("May include obligations that are difficult to reverse")
-    matters.push("Worth discussing with legal counsel if unclear")
-  } else if (riskLevel === "medium") {
-    matters.push("Establishes important obligations you need to follow")
-    matters.push("Affects how you can use or interact with the subject matter")
-    matters.push("Understanding this helps avoid unintentional breaches")
-  } else {
-    matters.push("Provides helpful context for the agreement")
-    matters.push("Contains standard terms typical for this type of document")
-    matters.push("Ensures both parties have clear expectations")
+function generateWhyMatters(title: string, riskLevel: string, text: string): string[] {
+  const matters: string[] = []
+  const titleLower = title.toLowerCase()
+  const textLower = text.toLowerCase()
+  
+  // Generate context-specific points based on content
+  if (textLower.includes("rent") || textLower.includes("payment")) {
+    matters.push("Specifies your financial obligations and when payments are due")
+    matters.push("Late payments may result in fees or other consequences")
+  }
+  if (textLower.includes("deposit")) {
+    matters.push("Your deposit may be at risk if terms are not followed")
+    matters.push("Know the conditions for getting your deposit back")
+  }
+  if (textLower.includes("terminate") || textLower.includes("cancel")) {
+    matters.push("Understand how you can exit this agreement")
+    matters.push("There may be penalties for early termination")
+  }
+  if (textLower.includes("prohibited") || textLower.includes("shall not")) {
+    matters.push("Violating these restrictions could have consequences")
+    matters.push("Make sure you can comply with these requirements")
+  }
+  if (textLower.includes("liability") || textLower.includes("responsible")) {
+    matters.push("Defines who bears financial risk if problems occur")
+    matters.push("Could limit your ability to recover damages")
+  }
+  
+  // Add risk-based points if needed
+  if (matters.length < 2) {
+    if (riskLevel === "high") {
+      matters.push("Contains terms that could significantly impact your rights")
+      matters.push("Worth discussing with legal counsel if unclear")
+    } else if (riskLevel === "medium") {
+      matters.push("Establishes important obligations you need to follow")
+      matters.push("Understanding this helps avoid unintentional issues")
+    } else {
+      matters.push("Provides helpful context for the agreement")
+      matters.push("Ensures both parties have clear expectations")
+    }
   }
 
-  return matters
+  return matters.slice(0, 3)
 }
 
 function extractDefinitions(text: string): any[] {

@@ -95,8 +95,12 @@ export function OriginalDocument({ clauses, activeClauseId, onClauseSelect }: Or
                 </h2>
 
                 {/* Clause Text */}
-                <div className="font-serif text-xs md:text-sm text-paper-foreground/85 leading-[1.7] whitespace-pre-line">
-                  {clause.originalText}
+                <div className="font-serif text-xs md:text-sm text-paper-foreground/85 leading-[1.8] break-words overflow-wrap-anywhere">
+                  {clause.originalText.split('\n').map((line, i) => (
+                    <p key={i} className={line.trim() ? "mb-3" : "mb-1"}>
+                      {line || '\u00A0'}
+                    </p>
+                  ))}
                 </div>
               </div>
             </article>
