@@ -85,7 +85,7 @@ export function NewAnalysisTab() {
       }
 
       const uploadResult = await uploadResponse.json()
-      const { text, documentId } = uploadResult
+      const { rawText, fileBase64, fileType, documentId } = uploadResult
 
       setUploadState("analyzing")
 
@@ -97,7 +97,13 @@ export function NewAnalysisTab() {
       const analyzeResponse = await fetch("/api/analyze-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, filename: uploadedFile.name, documentId }),
+        body: JSON.stringify({ 
+          rawText, 
+          fileBase64,
+          fileType,
+          filename: uploadedFile.name, 
+          documentId 
+        }),
       })
 
       clearInterval(analysisInterval)

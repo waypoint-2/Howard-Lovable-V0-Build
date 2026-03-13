@@ -1,309 +1,155 @@
-import { NextResponse } from "next/server"
+import { NextResponse, type NextRequest } from "next/server"
+import Anthropic from "@anthropic-ai/sdk"
+import { Ratelimit } from "@upstash/ratelimit"
+import { Redis } from "@upstash/redis"
 
-function parseDocumentIntoSections(text: string, filename: string) {
-  const lines = text.split("\n").filter((line) => line.trim())
-  const clauses: any[] = []
+// Initialize rate limiter
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+})
 
-  // Common section patterns
-  const sectionPatterns = [
-    /^(\d+)\.\s+(.+)$/, // "1. Section Title"
-    /^Section\s+(\d+)[:.]?\s*(.*)$/i, // "Section 1: Title"
-    /^Article\s+(\d+)[:.]?\s*(.*)$/i, // "Article 1: Title"
-    /^§\s*(\d+)[:.]?\s*(.*)$/, // "§ 1: Title"
-    /^([IVXLCDM]+)\.\s+(.+)$/, // "I. Section Title"
-    /^([A-Z])\.\s+(.+)$/, // "A. Section Title"
-    /^ARTICLE\s+([IVXLCDM]+)[:.]?\s*(.*)$/i, // "ARTICLE I: Title"
-  ]
+const ratelimit = new Ratelimit({
+  redis: redis,
+  limiter: Ratelimit.slidingWindow(10, "1 h"), // 10 analyses per hour per IP
+})
 
-  let currentSection: { number: string; title: string; content: string[] } | null = null
-  let sectionCount = 0
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+})
 
-  for (const line of lines) {
-    let matched = false
+interface Clause {
+  id: string
+  clauseNumber: string
+  title: string
+  humanTitle: string
+  subtitle: string
+  originalText: string
+  plainMeaning: string
+  whyMatters: string[]
+  riskLevel: "low" | "medium" | "high"
+  favors: string
+  commonness: "Standard" | "Aggressive" | "Favorable"
+  notableCharacteristics?: string[]
+  definitions?: Array<{
+    term: string
+    plainMeaning: string
+    example: string
+    importance: string
+  }>
+  questions?: Array<{
+    question: string
+    answer: string
+    clauseReference: string
+  }>
+}
 
-    for (const pattern of sectionPatterns) {
-      const match = line.match(pattern)
-      if (match) {
-        // Save previous section
-        if (currentSection && currentSection.content.length > 0) {
-          sectionCount++
-          clauses.push(createClause(currentSection, sectionCount))
-        }
+export async function POST(request: NextRequest) {
+  try {
+    // Rate limiting by IP
+    const ip = request.headers.get("x-forwarded-for") || "unknown"
+    const { success } = await ratelimit.limit(ip)
 
-        currentSection = {
-          number: match[1],
-          title: match[2] || `Section ${match[1]}`,
-          content: [],
-        }
-        matched = true
-        break
-      }
+    if (!success) {
+      return NextResponse.json(
+        { error: "Rate limit exceeded. Maximum 10 analyses per hour." },
+        { status: 429 }
+      )
     }
 
-    if (!matched && currentSection) {
-      currentSection.content.push(line)
-    } else if (!matched && !currentSection && line.length > 20) {
-      // Start capturing content even without a section header
-      currentSection = {
-        number: "1",
-        title: "Document Content",
-        content: [line],
-      }
+    const body = await request.json()
+    const { rawText, fileBase64, fileType, filename, documentId } = body
+
+    if (!rawText && !fileBase64) {
+      return NextResponse.json(
+        { error: "No document content provided" },
+        { status: 400 }
+      )
     }
-  }
 
-  // Save last section
-  if (currentSection && currentSection.content.length > 0) {
-    sectionCount++
-    clauses.push(createClause(currentSection, sectionCount))
-  }
+    console.log(`[v0] Analyzing document: ${filename}`)
 
-  // If no sections were found, create one from the entire document
-  if (clauses.length === 0) {
-    clauses.push({
-      id: "clause-1",
-      clauseNumber: "§ 1",
-      title: filename.replace(/\.[^/.]+$/, ""),
-      humanTitle: "Document Content",
-      subtitle: "Main document content",
-      originalText: text.substring(0, 2000),
-      plainMeaning:
-        "This document contains the terms and conditions as outlined in the text. Review each section carefully to understand your rights and obligations.",
-      whyMatters: [
-        "Understanding the full document helps you know what you are agreeing to",
-        "Key terms and conditions affect your rights",
-        "Being informed helps you make better decisions",
-      ],
-      riskLevel: "medium",
-      favors: "Neutral",
-      commonness: "Standard",
-      definitions: [],
-      questions: [
+    const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk — better to flag medium than miss it. Return valid JSON only. No preamble, no markdown, just the JSON array.`
+
+    const userPrompt = `Analyze this legal document and return a JSON array of clause objects. Each object must have EXACTLY these fields:
+
+- id: string, format "clause-N"
+- clauseNumber: string, format "§ N"
+- title: string, original legal heading
+- humanTitle: string, max 4 words plain English title
+- subtitle: string, e.g. "142 words • high risk"
+- originalText: string, full original clause text
+- plainMeaning: string, 2-3 sentence plain English explanation
+- whyMatters: string array, 2-4 practical bullet points
+- riskLevel: "low" | "medium" | "high"
+- favors: string, e.g. "Licensor" or "Licensee" or "Neutral"
+- commonness: "Standard" | "Aggressive" | "Favorable"
+- notableCharacteristics: optional string array, 2-3 bullets for medium/high risk clauses only
+- definitions: optional array of { term, plainMeaning, example, importance } for key legal terms in this clause
+- questions: optional array of { question, answer, clauseReference }, 1-2 questions a non-lawyer would ask
+
+If the document has no clearly numbered clauses, identify logical sections yourself and number them sequentially. Never skip content — every substantive provision must be captured.
+
+Return ONLY a JSON array starting with [. No wrapper object, no markdown.`
+
+    // Build the message with appropriate content type
+    const messageContent: Anthropic.ContentBlockParam[] = []
+
+    if (rawText) {
+      messageContent.push({
+        type: "text",
+        text: rawText,
+      })
+    } else if (fileBase64) {
+      const mediaType = fileType === "application/pdf" ? "application/pdf" : (fileType as "image/jpeg" | "image/png" | "image/gif" | "image/webp")
+      messageContent.push({
+        type: "document",
+        source: {
+          type: "base64",
+          media_type: mediaType,
+          data: fileBase64,
+        },
+      })
+    }
+
+    messageContent.push({
+      type: "text",
+      text: userPrompt,
+    })
+
+    // Call Claude API
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 8000,
+      system: systemPrompt,
+      messages: [
         {
-          question: "What is this document about?",
-          answer:
-            "This document outlines specific terms, conditions, or agreements that the parties involved need to understand and follow.",
-          clauseReference: "§ 1",
+          role: "user",
+          content: messageContent,
         },
       ],
     })
-  }
 
-  return clauses
-}
-
-function createClause(section: { number: string; title: string; content: string[] }, index: number) {
-  const originalText = section.content.join("\n").trim()
-  const wordCount = originalText.split(/\s+/).length
-
-  // Determine risk level based on keywords
-  const highRiskKeywords = ["indemnify", "liability", "termination", "breach", "damages", "waive", "forfeit", "penalty"]
-  const mediumRiskKeywords = ["obligation", "requirement", "must", "shall", "warranty", "guarantee", "limitation"]
-
-  const textLower = originalText.toLowerCase()
-  let riskLevel = "low"
-  let riskScore = 0
-
-  highRiskKeywords.forEach((keyword) => {
-    if (textLower.includes(keyword)) riskScore += 2
-  })
-  mediumRiskKeywords.forEach((keyword) => {
-    if (textLower.includes(keyword)) riskScore += 1
-  })
-
-  if (riskScore >= 4) riskLevel = "high"
-  else if (riskScore >= 2) riskLevel = "medium"
-
-  // Determine who the clause favors
-  let favors = "Neutral"
-  if (textLower.includes("licensor") || textLower.includes("company") || textLower.includes("employer")) {
-    favors = textLower.includes("licensor") ? "Licensor" : textLower.includes("employer") ? "Employer" : "Provider"
-  } else if (textLower.includes("licensee") || textLower.includes("user") || textLower.includes("employee")) {
-    favors = textLower.includes("licensee") ? "Licensee" : textLower.includes("employee") ? "Employee" : "User"
-  }
-
-  // Create human-readable title
-  const humanTitle =
-    section.title
-      .replace(/[^a-zA-Z\s]/g, "")
-      .split(" ")
-      .slice(0, 4)
-      .join(" ")
-      .trim() || `Section ${index}`
-
-  // Generate plain meaning
-  const plainMeaning = generatePlainMeaning(section.title, originalText, riskLevel)
-
-  // Generate why it matters
-  const whyMatters = generateWhyMatters(section.title, riskLevel, originalText)
-
-  // Extract definitions if any
-  const definitions = extractDefinitions(originalText)
-
-  return {
-    id: `clause-${index}`,
-    clauseNumber: `§ ${section.number}`,
-    title: section.title,
-    humanTitle,
-    subtitle: `${wordCount} words • ${riskLevel} risk`,
-    originalText: originalText.substring(0, 3000),
-    plainMeaning,
-    whyMatters,
-    riskLevel,
-    favors,
-    commonness: riskLevel === "high" ? "Aggressive" : riskLevel === "medium" ? "Standard" : "Favorable",
-    definitions,
-    questions: [
-      {
-        question: `What does the ${humanTitle} section mean for me?`,
-        answer: plainMeaning,
-        clauseReference: `§ ${section.number}`,
-      },
-      {
-        question: "Is this section standard in similar agreements?",
-        answer:
-          riskLevel === "high"
-            ? "This section contains terms that may be more aggressive than typical agreements. Consider reviewing carefully."
-            : "This section contains fairly standard language found in similar agreements.",
-        clauseReference: `§ ${section.number}`,
-      },
-    ],
-  }
-}
-
-function generatePlainMeaning(title: string, text: string, riskLevel: string): string {
-  const titleLower = title.toLowerCase()
-  const textLower = text.toLowerCase()
-  
-  // Extract key information from the actual text content
-  const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 10)
-  const firstSentence = sentences[0]?.trim() || ""
-  
-  // Try to create a summary based on actual content
-  if (titleLower.includes("definition") || titleLower.includes("interpret")) {
-    return `This section defines key terms used in the document. ${firstSentence.length > 20 ? 'It establishes that ' + firstSentence.substring(0, 150).toLowerCase() + '...' : 'Understanding these definitions is crucial for interpreting the agreement.'}`
-  }
-  if (titleLower.includes("rent") || textLower.includes("rent") || textLower.includes("tenant")) {
-    const rentMatch = text.match(/\$[\d,]+(?:\.\d{2})?/)
-    return `This section covers rent payments and related financial obligations. ${rentMatch ? `The rent amount referenced is ${rentMatch[0]}.` : ''} It explains when and how payments should be made, and any additional charges you may be responsible for.`
-  }
-  if (titleLower.includes("deposit") || textLower.includes("deposit")) {
-    return `This section explains the security deposit requirements - how much is required, when it must be paid, and under what conditions it will be returned. Pay attention to any deductions that may be made.`
-  }
-  if (titleLower.includes("smoking") || textLower.includes("smoking") || textLower.includes("prohibited")) {
-    return `This section outlines specific rules and restrictions that apply to the property or agreement. Violating these rules could result in penalties or termination of the agreement.`
-  }
-  if (titleLower.includes("grant") || titleLower.includes("license")) {
-    return `This section describes what rights or permissions are being granted. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It specifies the scope and limitations of what you can do.'}`
-  }
-  if (titleLower.includes("payment") || titleLower.includes("fee") || textLower.includes("payment")) {
-    return `This section outlines payment obligations. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It specifies amounts due, payment schedules, and consequences for late payments.'}`
-  }
-  if (titleLower.includes("termination") || titleLower.includes("cancel")) {
-    return `This section explains how the agreement can be ended. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It covers conditions for termination and what happens afterward.'}`
-  }
-  if (titleLower.includes("liability") || titleLower.includes("indemnif")) {
-    return `This section addresses legal responsibility and liability. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It limits who is responsible if something goes wrong.'}`
-  }
-  if (titleLower.includes("confidential") || titleLower.includes("privacy")) {
-    return `This section covers privacy and confidentiality requirements. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It specifies what information must be kept private.'}`
-  }
-  if (titleLower.includes("warrant") || titleLower.includes("guarantee")) {
-    return `This section describes warranties and guarantees. ${firstSentence.length > 20 ? firstSentence.substring(0, 200) : 'It outlines what is and is not promised.'}`
-  }
-  if (titleLower.includes("parties") || textLower.includes("landlord") || textLower.includes("lessor")) {
-    return `This section identifies who is involved in this agreement - the parties, their roles, and their contact information. These details are important for knowing who to contact and who is bound by the terms.`
-  }
-  if (titleLower.includes("property") || titleLower.includes("premises") || textLower.includes("address")) {
-    return `This section describes the property or premises covered by this agreement, including the address and any specific areas or items that are included or excluded.`
-  }
-  
-  // Default: try to use the first sentence if available
-  if (firstSentence.length > 30) {
-    return `This section covers: ${firstSentence.substring(0, 250)}${firstSentence.length > 250 ? '...' : ''}`
-  }
-
-  return riskLevel === "high"
-    ? "This section contains important terms that significantly affect your rights and obligations. Review it carefully and consider seeking clarification on any unclear points."
-    : "This section establishes terms for this agreement. Review it to understand what you are agreeing to."
-}
-
-function generateWhyMatters(title: string, riskLevel: string, text: string): string[] {
-  const matters: string[] = []
-  const titleLower = title.toLowerCase()
-  const textLower = text.toLowerCase()
-  
-  // Generate context-specific points based on content
-  if (textLower.includes("rent") || textLower.includes("payment")) {
-    matters.push("Specifies your financial obligations and when payments are due")
-    matters.push("Late payments may result in fees or other consequences")
-  }
-  if (textLower.includes("deposit")) {
-    matters.push("Your deposit may be at risk if terms are not followed")
-    matters.push("Know the conditions for getting your deposit back")
-  }
-  if (textLower.includes("terminate") || textLower.includes("cancel")) {
-    matters.push("Understand how you can exit this agreement")
-    matters.push("There may be penalties for early termination")
-  }
-  if (textLower.includes("prohibited") || textLower.includes("shall not")) {
-    matters.push("Violating these restrictions could have consequences")
-    matters.push("Make sure you can comply with these requirements")
-  }
-  if (textLower.includes("liability") || textLower.includes("responsible")) {
-    matters.push("Defines who bears financial risk if problems occur")
-    matters.push("Could limit your ability to recover damages")
-  }
-  
-  // Add risk-based points if needed
-  if (matters.length < 2) {
-    if (riskLevel === "high") {
-      matters.push("Contains terms that could significantly impact your rights")
-      matters.push("Worth discussing with legal counsel if unclear")
-    } else if (riskLevel === "medium") {
-      matters.push("Establishes important obligations you need to follow")
-      matters.push("Understanding this helps avoid unintentional issues")
-    } else {
-      matters.push("Provides helpful context for the agreement")
-      matters.push("Ensures both parties have clear expectations")
-    }
-  }
-
-  return matters.slice(0, 3)
-}
-
-function extractDefinitions(text: string): any[] {
-  const definitions: any[] = []
-
-  // Look for patterns like "Term" means or 'Term' means
-  const defPattern = /["']([^"']+)["']\s+(?:means?|refers?\s+to|shall\s+mean)/gi
-  let match
-
-  while ((match = defPattern.exec(text)) !== null && definitions.length < 5) {
-    definitions.push({
-      term: match[1],
-      plainMeaning: `The specific meaning of "${match[1]}" as used in this document.`,
-      example: `When you see "${match[1]}" in this agreement, it refers to the definition provided here.`,
-      importance: "Understanding this term helps interpret the entire document correctly.",
-    })
-  }
-
-  return definitions
-}
-
-export async function POST(request: Request) {
-  try {
-    const { text, filename } = await request.json()
-
-    if (!text || text.trim().length === 0) {
-      return NextResponse.json({ error: "No text content provided" }, { status: 400 })
+    // Extract the text content from the response
+    const textContent = response.content.find((block) => block.type === "text")
+    if (!textContent || textContent.type !== "text") {
+      return NextResponse.json(
+        { error: "No text response from Claude" },
+        { status: 500 }
+      )
     }
 
-    // Parse document into sections using rule-based analysis
-    const clauses = parseDocumentIntoSections(text, filename)
-
-    // Generate a unique document ID
-    const documentId = `doc-${Date.now()}-${Math.random().toString(36).substring(7)}`
+    // Parse the JSON response
+    let clauses: Clause[]
+    try {
+      clauses = JSON.parse(textContent.text)
+    } catch (parseError) {
+      console.error("[v0] Failed to parse Claude response:", textContent.text)
+      return NextResponse.json(
+        { error: "Analysis failed" },
+        { status: 500 }
+      )
+    }
 
     return NextResponse.json({
       documentId,
@@ -312,7 +158,10 @@ export async function POST(request: Request) {
       analyzedAt: new Date().toISOString(),
     })
   } catch (error) {
-    console.error("Analysis error:", error)
-    return NextResponse.json({ error: "Failed to analyze document" }, { status: 500 })
+    console.error("[v0] Analysis error:", error)
+    return NextResponse.json(
+      { error: "Analysis failed" },
+      { status: 500 }
+    )
   }
 }

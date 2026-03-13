@@ -2,44 +2,14 @@ import { put } from "@vercel/blob"
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
 import * as mammoth from "mammoth"
-import * as pdf from "pdf-parse/lib/pdf-parse"
 
-async function extractText(file: File): Promise<string> {
-  const buffer = await file.arrayBuffer()
+async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> {
+  const result = await mammoth.extractRawText({ arrayBuffer: buffer })
+  return result.value
+}
 
-  if (file.type === "application/pdf") {
-    try {
-      const data = await pdf(Buffer.from(buffer))
-      // Check if this is a scanned PDF (very little text)
-      if (data.text.trim().length < 100 && data.numpages > 1) {
-        throw new Error("SCANNED_PDF")
-      }
-      return data.text
-    } catch (error) {
-      if (error instanceof Error && error.message === "SCANNED_PDF") {
-        throw error
-      }
-      console.error("[v0] PDF parsing error:", error)
-      throw new Error("Failed to parse PDF")
-    }
-  } else if (
-    file.type ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-    file.name.endsWith(".docx")
-  ) {
-    try {
-      const result = await mammoth.extractRawText({ arrayBuffer: buffer })
-      return result.value
-    } catch (error) {
-      console.error("[v0] DOCX parsing error:", error)
-      throw new Error("Failed to parse DOCX")
-    }
-  } else if (file.type === "text/plain" || file.name.endsWith(".txt")) {
-    const text = new TextDecoder().decode(buffer)
-    return text
-  } else {
-    throw new Error("Unsupported file type")
-  }
+async function fileToBase64(buffer: ArrayBuffer): Promise<string> {
+  return Buffer.from(buffer).toString("base64")
 }
 
 export async function POST(request: NextRequest) {
@@ -53,35 +23,60 @@ export async function POST(request: NextRequest) {
 
     console.log(`[v0] Uploading file: ${file.name} (${file.size} bytes)`)
 
-    // Extract text from file
-    let rawText: string
-    try {
-      rawText = await extractText(file)
-    } catch (error) {
-      if (error instanceof Error && error.message === "SCANNED_PDF") {
+    const buffer = await file.arrayBuffer()
+    let rawText: string | undefined
+    let fileBase64: string | undefined
+    let fileType: string = file.type
+
+    // Extract content based on file type
+    if (
+      file.type ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+      file.name.toLowerCase().endsWith(".docx") ||
+      file.name.toLowerCase().endsWith(".doc")
+    ) {
+      try {
+        rawText = await extractTextFromDocx(buffer)
+      } catch (error) {
+        console.error("[v0] DOCX parsing error:", error)
         return NextResponse.json(
-          {
-            error: "This appears to be a scanned document. Scanned PDF support coming soon.",
-          },
+          { error: "Failed to parse DOCX file" },
           { status: 400 }
         )
       }
-      console.error("[v0] Text extraction error:", error)
+    } else if (
+      file.type === "application/pdf" ||
+      file.name.toLowerCase().endsWith(".pdf")
+    ) {
+      // For PDFs, send as base64 for Claude to process
+      fileBase64 = await fileToBase64(buffer)
+      fileType = "application/pdf"
+    } else if (
+      file.type === "text/plain" ||
+      file.name.toLowerCase().endsWith(".txt")
+    ) {
+      // For plain text files, extract as text
+      rawText = new TextDecoder().decode(buffer)
+    } else if (
+      file.type.startsWith("image/") ||
+      file.name.toLowerCase().match(/\.(png|jpg|jpeg|gif|webp)$/i)
+    ) {
+      // For images, send as base64
+      fileBase64 = await fileToBase64(buffer)
+      fileType = file.type || "image/jpeg"
+    } else {
       return NextResponse.json(
-        {
-          error:
-            error instanceof Error ? error.message : "Failed to extract text",
-        },
+        { error: "Unsupported file type. Please upload PDF, DOCX, TXT, or image files." },
         { status: 400 }
       )
     }
 
-    // Upload to Vercel Blob (must be public access)
+    // Upload to Vercel Blob
     const blob = await put(`documents/${Date.now()}-${file.name}`, file, {
       access: "public",
     })
 
-    // Try to save document to Supabase (optional - may not have auth)
+    // Try to save document to Supabase (optional)
     let documentId = null
     try {
       const supabase = await createClient()
@@ -96,7 +91,7 @@ export async function POST(request: NextRequest) {
             user_id: user.id,
             filename: file.name,
             blob_url: blob.url,
-            raw_text: rawText,
+            raw_text: rawText || null,
             file_size: file.size,
             file_type: file.type,
             upload_status: "success",
@@ -118,7 +113,9 @@ export async function POST(request: NextRequest) {
       size: file.size,
       type: file.type,
       documentId,
-      text: rawText,
+      rawText,
+      fileBase64,
+      fileType,
     })
   } catch (error) {
     console.error("[v0] Upload error:", error)
