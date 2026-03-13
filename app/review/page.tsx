@@ -11,6 +11,7 @@ function ReviewContent() {
   const [documentData, setDocumentData] = useState<{
     clauses: any[]
     filename: string
+    document_title?: string
   } | null>(null)
 
   useEffect(() => {
@@ -38,7 +39,11 @@ function ReviewContent() {
     )
   }
 
-  return <LegalTranslator documentData={documentData} />
+  return <LegalTranslator documentData={{
+    clauses: documentData.clauses,
+    filename: documentData.filename,
+    documentTitle: documentData.document_title,
+  }} />
 }
 
 export default function ReviewPage() {

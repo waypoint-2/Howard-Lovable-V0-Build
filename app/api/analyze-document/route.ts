@@ -18,6 +18,36 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 })
 
+// Helper function to extract document title from first heading/line
+function extractDocumentTitle(rawText: string): string {
+  if (!rawText) return ""
+  
+  const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+  
+  // Look for lines that are all caps or look like titles
+  for (const line of lines.slice(0, 10)) {
+    // Skip very short lines and common headers
+    if (line.length < 5 || line.length > 150) continue
+    
+    // All caps title (e.g., "NON-DISCLOSURE AGREEMENT")
+    if (line === line.toUpperCase() && line.length > 5) {
+      return line
+    }
+    
+    // Title case with common legal doc keywords
+    if ((line.includes("Agreement") || line.includes("Contract") || 
+         line.includes("License") || line.includes("Policy") ||
+         line.includes("Terms") || line.includes("Confidentiality") ||
+         line.includes("Disclosure") || line.includes("Service")) && 
+        line.length > 10) {
+      return line
+    }
+  }
+  
+  // Fallback to first substantial line
+  return lines[0] || ""
+}
+
 interface Clause {
   id: string
   clauseNumber: string
@@ -69,9 +99,18 @@ export async function POST(request: NextRequest) {
 
     console.log(`[v0] Analyzing document: ${filename}`)
 
-    const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk — better to flag medium than miss it. Return valid JSON only. No preamble, no markdown, just the JSON array.`
+    // Extract document title from the first line/heading
+    const extractedTitle = extractDocumentTitle(rawText || "")
 
-    const userPrompt = `Analyze this legal document and return a JSON array of clause objects. Each object must have EXACTLY these fields:
+    const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk — better to flag medium than miss it. Return valid JSON only. No preamble, no markdown, just the JSON object.`
+
+    const userPrompt = `Analyze this legal document and return a JSON object with this top-level structure:
+{
+  "document_title": "string - the actual document title/heading from the document",
+  "clauses": [array of clause objects]
+}
+
+Each clause object must have EXACTLY these fields:
 
 - id: string, format "clause-N"
 - clauseNumber: string, format "§ N"
@@ -90,7 +129,9 @@ export async function POST(request: NextRequest) {
 
 If the document has no clearly numbered clauses, identify logical sections yourself and number them sequentially. Never skip content — every substantive provision must be captured.
 
-Return ONLY a JSON array starting with [. No wrapper object, no markdown.`
+The document_title should be the actual heading or title from the document (like 'NON-DISCLOSURE AGREEMENT', 'SOFTWARE LICENSE', etc.), not the filename.
+
+Return ONLY valid JSON. No wrapper, no markdown.`
 
     // Build the message with appropriate content type
     const messageContent: Anthropic.ContentBlockParam[] = []
@@ -140,9 +181,9 @@ Return ONLY a JSON array starting with [. No wrapper object, no markdown.`
     }
 
     // Parse the JSON response
-    let clauses: Clause[]
+    let parsedResponse: { document_title: string; clauses: Clause[] }
     try {
-      clauses = JSON.parse(textContent.text)
+      parsedResponse = JSON.parse(textContent.text)
     } catch (parseError) {
       console.error("[v0] Failed to parse Claude response:", textContent.text)
       return NextResponse.json(
@@ -151,9 +192,13 @@ Return ONLY a JSON array starting with [. No wrapper object, no markdown.`
       )
     }
 
+    const { document_title, clauses } = parsedResponse
+    const finalDocumentTitle = document_title || extractedTitle || filename
+
     return NextResponse.json({
       documentId,
       filename,
+      document_title: finalDocumentTitle,
       clauses,
       analyzedAt: new Date().toISOString(),
     })

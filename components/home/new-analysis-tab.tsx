@@ -120,6 +120,7 @@ export function NewAnalysisTab() {
       sessionStorage.setItem(
         "analyzedDocument",
         JSON.stringify({
+          document_title: result.document_title,
           clauses: result.clauses,
           filename: result.filename,
           documentId: result.documentId,
