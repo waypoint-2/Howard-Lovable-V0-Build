@@ -85,7 +85,7 @@ export function LegalTranslator({ documentData }: LegalTranslatorProps) {
   return (
     <div className="flex flex-col h-[100dvh] bg-background">
       {/* Desktop Nav - hidden on mobile */}
-      <div className="hidden lg:block">
+      <div className="hidden lg:block relative z-50">
         <AppNav documentTitle={documentTitle} />
       </div>
 
