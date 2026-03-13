@@ -117,7 +117,13 @@ Each clause object must have EXACTLY these fields:
 - title: string, original legal heading
 - humanTitle: string, max 4 words plain English title
 - subtitle: string, e.g. "142 words • high risk"
-- originalText: string, full original clause text
+- originalText: string, full original clause text WITH MARKDOWN FORMATTING PRESERVED:
+  - Use **bold** for section headings and defined terms
+  - Use numbered lists (1. 2. 3.) for numbered provisions
+  - Indent lettered sub-clauses on separate lines: "   (a) text here"
+  - Indent roman numerals further: "      (i) text here"
+  - Preserve paragraph breaks with blank lines
+  - Keep the original text but add markdown to maintain structure
 - plainMeaning: string, 2-3 sentence plain English explanation
 - whyMatters: string array, 2-4 practical bullet points
 - riskLevel: "low" | "medium" | "high"
