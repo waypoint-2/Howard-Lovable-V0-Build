@@ -117,8 +117,10 @@ Each clause object must have EXACTLY these fields:
 - title: string, original legal heading
 - humanTitle: string, max 4 words plain English title
 - subtitle: string, e.g. "142 words • high risk"
-- originalText: string, full original clause text WITH MARKDOWN FORMATTING PRESERVED:
-  - Use **bold** for section headings and defined terms
+- originalText: string, full original clause text (WITHOUT the section heading/title, since it's shown separately) WITH MARKDOWN FORMATTING PRESERVED:
+  - Do NOT include the clause title or heading as the first line of originalText
+  - Start with the actual content of the clause
+  - Use **bold** for defined terms and internal section headings within the clause
   - Use numbered lists (1. 2. 3.) for numbered provisions
   - Indent lettered sub-clauses on separate lines: "   (a) text here"
   - Indent roman numerals further: "      (i) text here"
