@@ -8,9 +8,65 @@ interface OriginalDocumentProps {
   clauses: Clause[]
   activeClauseId: string | null
   onClauseSelect: (clauseId: string) => void
+  documentTitle?: string
 }
 
-export function OriginalDocument({ clauses, activeClauseId, onClauseSelect }: OriginalDocumentProps) {
+// Format text with proper indentation for lists
+function formatClauseText(text: string) {
+  const lines = text.split('\n')
+  const formattedLines: { text: string; indent: number; isBold: boolean; isNumbered: boolean }[] = []
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      formattedLines.push({ text: '', indent: 0, isBold: false, isNumbered: false })
+      continue
+    }
+
+    // Check for section headings (all caps or ends with colon)
+    const isHeading = /^[A-Z][A-Z\s\d.]+[:.]*$/.test(trimmed) || 
+                     /^(ARTICLE|SECTION|WHEREAS|NOW THEREFORE)/i.test(trimmed)
+
+    // Check for numbered items: 1. 2. 3. etc
+    const numberedMatch = trimmed.match(/^(\d+)\.\s+(.*)/)
+    // Check for lettered items: (a) (b) (c) or a. b. c.
+    const letteredMatch = trimmed.match(/^\(([a-z])\)\s+(.*)/i) || trimmed.match(/^([a-z])\.\s+(.*)/i)
+    // Check for roman numerals: (i) (ii) (iii) or i. ii. iii.
+    const romanMatch = trimmed.match(/^\(([ivxlcdm]+)\)\s+(.*)/i) || trimmed.match(/^([ivxlcdm]+)\.\s+(.*)/i)
+
+    let indent = 0
+    let displayText = trimmed
+    let isNumbered = false
+
+    if (romanMatch) {
+      indent = 2
+      isNumbered = true
+    } else if (letteredMatch) {
+      indent = 1
+      isNumbered = true
+    } else if (numberedMatch) {
+      indent = 0
+      isNumbered = true
+    }
+
+    formattedLines.push({ 
+      text: displayText, 
+      indent, 
+      isBold: isHeading,
+      isNumbered 
+    })
+  }
+
+  return formattedLines
+}
+
+export function OriginalDocument({ clauses, activeClauseId, onClauseSelect, documentTitle }: OriginalDocumentProps) {
+  // Get today's date formatted
+  const todayDate = new Date().toLocaleDateString('en-US', { 
+    year: 'numeric', 
+    month: 'long', 
+    day: 'numeric' 
+  })
   const containerRef = useRef<HTMLDivElement>(null)
   const clauseRefs = useRef<Map<string, HTMLDivElement>>(new Map())
 
@@ -39,11 +95,11 @@ export function OriginalDocument({ clauses, activeClauseId, onClauseSelect }: Or
         {/* Document Header */}
         <header className="mb-8 md:mb-12 pb-6 md:pb-8 border-b border-highlight-border animate-fade-in">
           <h1 className="font-serif text-xl md:text-2xl text-paper-foreground mb-2 text-balance">
-            Software License Agreement
+            {documentTitle || "Document Review"}
           </h1>
           <div className="flex flex-wrap items-center gap-2 md:gap-3 mt-3">
             <p className="font-serif text-xs md:text-sm text-muted-foreground italic">
-              Effective Date: January 1, 2024
+              Effective Date: {todayDate}
             </p>
             <span className="px-2 py-0.5 text-[10px] font-medium tracking-wide bg-[var(--warning-bg)] text-[var(--warning)] border border-[var(--warning-border)] rounded-full">
               Under Review
@@ -95,12 +151,25 @@ export function OriginalDocument({ clauses, activeClauseId, onClauseSelect }: Or
                 </h2>
 
                 {/* Clause Text */}
-                <div className="font-serif text-xs md:text-sm text-paper-foreground/85 leading-[1.8] break-words overflow-wrap-anywhere">
-                  {clause.originalText.split('\n').map((line, i) => (
-                    <p key={i} className={line.trim() ? "mb-3" : "mb-1"}>
-                      {line || '\u00A0'}
-                    </p>
-                  ))}
+                <div className="font-serif text-xs md:text-sm text-paper-foreground/85 leading-[1.8] space-y-2">
+                  {formatClauseText(clause.originalText).map((line, i) => {
+                    if (!line.text.trim()) {
+                      return <div key={i} className="h-1" />
+                    }
+                    
+                    const baseClasses = "block"
+                    const indentClasses = 
+                      line.indent === 2 ? "ml-8" : 
+                      line.indent === 1 ? "ml-4" : 
+                      ""
+                    const boldClass = line.isBold ? "font-semibold" : ""
+                    
+                    return (
+                      <div key={i} className={`${baseClasses} ${indentClasses} ${boldClass}`}>
+                        {line.text}
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             </article>
