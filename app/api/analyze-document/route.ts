@@ -209,7 +209,19 @@ async function analyzeChunk(
       throw new Error("No text response from Claude")
     }
     
-    return JSON.parse(textContent.text)
+    // Strip markdown code fences if present
+    let jsonText = textContent.text.trim()
+    if (jsonText.startsWith("```json")) {
+      jsonText = jsonText.slice(7)
+    } else if (jsonText.startsWith("```")) {
+      jsonText = jsonText.slice(3)
+    }
+    if (jsonText.endsWith("```")) {
+      jsonText = jsonText.slice(0, -3)
+    }
+    jsonText = jsonText.trim()
+    
+    return JSON.parse(jsonText)
   } catch (error) {
     clearTimeout(timeout)
     throw error
