@@ -1,6 +1,6 @@
 "use client"
 
-import { useRef, useEffect } from "react"
+import { useRef, useEffect, useState } from "react"
 import { cn } from "@/lib/utils"
 import type { Clause } from "@/lib/legal-data"
 import ReactMarkdown from "react-markdown"
@@ -13,14 +13,19 @@ interface OriginalDocumentProps {
 }
 
 export function OriginalDocument({ clauses, activeClauseId, onClauseSelect, documentTitle }: OriginalDocumentProps) {
-  // Get today's date formatted
-  const todayDate = new Date().toLocaleDateString('en-US', { 
-    year: 'numeric', 
-    month: 'long', 
-    day: 'numeric' 
-  })
+  // Use state for date to avoid hydration mismatch
+  const [todayDate, setTodayDate] = useState<string>("")
   const containerRef = useRef<HTMLDivElement>(null)
   const clauseRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+
+  useEffect(() => {
+    // Set date on client side only to avoid hydration mismatch
+    setTodayDate(new Date().toLocaleDateString('en-US', { 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    }))
+  }, [])
 
   useEffect(() => {
     if (activeClauseId && clauseRefs.current.has(activeClauseId)) {
