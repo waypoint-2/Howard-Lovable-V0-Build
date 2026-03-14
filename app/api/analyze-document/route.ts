@@ -180,10 +180,10 @@ async function analyzeChunk(
   chunkIndex: number,
   totalChunks: number
 ): Promise<{ document_title?: string; clauses: Clause[] }> {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT)
+  console.log(`[v0] analyzeChunk: Starting chunk ${chunkIndex + 1}/${totalChunks}`)
   
   try {
+    console.log(`[v0] analyzeChunk: Calling Claude API...`)
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 8000,
@@ -202,12 +202,15 @@ async function analyzeChunk(
       ],
     })
     
-    clearTimeout(timeout)
+    console.log(`[v0] analyzeChunk: Claude API responded, stop_reason: ${response.stop_reason}`)
     
     const textContent = response.content.find((block) => block.type === "text")
     if (!textContent || textContent.type !== "text") {
+      console.error("[v0] analyzeChunk: No text content in response")
       throw new Error("No text response from Claude")
     }
+    
+    console.log(`[v0] analyzeChunk: Response length: ${textContent.text.length} chars`)
     
     // Strip markdown code fences if present
     let jsonText = textContent.text.trim()
@@ -221,20 +224,27 @@ async function analyzeChunk(
     }
     jsonText = jsonText.trim()
     
-    return JSON.parse(jsonText)
+    console.log(`[v0] analyzeChunk: Parsing JSON...`)
+    const parsed = JSON.parse(jsonText)
+    console.log(`[v0] analyzeChunk: Successfully parsed, found ${parsed.clauses?.length || 0} clauses`)
+    return parsed
   } catch (error) {
-    clearTimeout(timeout)
+    console.error(`[v0] analyzeChunk: Error -`, error instanceof Error ? error.message : error)
     throw error
   }
 }
 
 export async function POST(request: NextRequest) {
+  console.log("[v0] POST /api/analyze-document: Starting...")
+  
   try {
     // Rate limiting by IP
     const ip = request.headers.get("x-forwarded-for") || "unknown"
+    console.log(`[v0] Rate limit check for IP: ${ip}`)
     const { success } = await ratelimit.limit(ip)
 
     if (!success) {
+      console.log("[v0] Rate limit exceeded")
       return NextResponse.json(
         { error: "Rate limit exceeded. Maximum 10 analyses per hour." },
         { status: 429 }
@@ -243,8 +253,10 @@ export async function POST(request: NextRequest) {
 
     const body = await request.json()
     const { rawText, fileBase64, fileType, filename, documentId } = body
+    console.log(`[v0] Received: filename=${filename}, hasRawText=${!!rawText}, hasBase64=${!!fileBase64}, textLength=${rawText?.length || 0}`)
 
     if (!rawText && !fileBase64) {
+      console.log("[v0] Error: No content provided")
       return NextResponse.json(
         { error: "No document content provided" },
         { status: 400 }
@@ -252,9 +264,11 @@ export async function POST(request: NextRequest) {
     }
 
     const extractedTitle = extractDocumentTitle(rawText || "")
+    console.log(`[v0] Extracted title: ${extractedTitle}`)
     
     // For PDF/images, use base64 directly (no chunking)
     if (fileBase64) {
+      console.log(`[v0] Processing base64 file, type: ${fileType}`)
       const mediaType = fileType === "application/pdf" ? "application/pdf" : (fileType as "image/jpeg" | "image/png" | "image/gif" | "image/webp")
       const content: Anthropic.ContentBlockParam[] = [{
         type: "document",
@@ -267,6 +281,7 @@ export async function POST(request: NextRequest) {
       
       const result = await analyzeChunk(content, false, 0, 1)
       const finalDocumentTitle = result.document_title || extractedTitle || filename
+      console.log(`[v0] Analysis complete for base64, clauses: ${result.clauses?.length || 0}`)
       
       return NextResponse.json({
         documentId,
@@ -280,11 +295,13 @@ export async function POST(request: NextRequest) {
     // For text content, chunk if needed
     const chunks = splitIntoChunks(rawText)
     const isMultiChunk = chunks.length > 1
+    console.log(`[v0] Text content split into ${chunks.length} chunk(s)`)
     
     let allClauses: Clause[] = []
     let documentTitle = ""
     
     for (let i = 0; i < chunks.length; i++) {
+      console.log(`[v0] Processing chunk ${i + 1}/${chunks.length}, length: ${chunks[i].length}`)
       const content: Anthropic.ContentBlockParam[] = [{
         type: "text",
         text: chunks[i],
@@ -304,9 +321,11 @@ export async function POST(request: NextRequest) {
       }))
       
       allClauses = [...allClauses, ...renumberedClauses]
+      console.log(`[v0] Chunk ${i + 1} complete, total clauses so far: ${allClauses.length}`)
     }
     
     const finalDocumentTitle = documentTitle || extractedTitle || filename
+    console.log(`[v0] All chunks processed, returning ${allClauses.length} clauses`)
 
     return NextResponse.json({
       documentId,
@@ -317,12 +336,31 @@ export async function POST(request: NextRequest) {
     })
   } catch (error) {
     console.error("[v0] Analysis error:", error)
-    const errorMessage = error instanceof Error && error.name === "AbortError" 
-      ? "Analysis timed out. Please try with a smaller document."
-      : "Analysis failed"
+    
+    let errorMessage = "Analysis failed"
+    let statusCode = 500
+    
+    if (error instanceof Error) {
+      console.error(`[v0] Error name: ${error.name}, message: ${error.message}`)
+      
+      if (error.name === "AbortError") {
+        errorMessage = "Analysis timed out. Please try with a smaller document."
+      } else if (error.message.includes("rate limit") || error.message.includes("429")) {
+        errorMessage = "API rate limit reached. Please try again in a few minutes."
+        statusCode = 429
+      } else if (error.message.includes("credit") || error.message.includes("billing")) {
+        errorMessage = "API billing issue. Please check your Anthropic account."
+        statusCode = 402
+      } else if (error.message.includes("JSON")) {
+        errorMessage = "Failed to parse AI response. Please try again."
+      } else {
+        errorMessage = `Analysis failed: ${error.message}`
+      }
+    }
+    
     return NextResponse.json(
       { error: errorMessage },
-      { status: 500 }
+      { status: statusCode }
     )
   }
 }
