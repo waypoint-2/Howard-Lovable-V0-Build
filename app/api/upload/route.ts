@@ -4,7 +4,8 @@ import { createClient } from "@/lib/supabase/server"
 import * as mammoth from "mammoth"
 
 async function extractTextFromDocx(buffer: ArrayBuffer): Promise<string> {
-  const result = await mammoth.extractRawText({ arrayBuffer: buffer })
+  const nodeBuffer = Buffer.from(buffer)
+  const result = await mammoth.extractRawText({ buffer: nodeBuffer })
   return result.value
 }
 
