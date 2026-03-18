@@ -224,6 +224,16 @@ async function analyzeChunk(
     }
     jsonText = jsonText.trim()
     
+    // Sanitize control characters inside JSON string values only
+    // This regex finds string contents and escapes control chars within them
+    jsonText = jsonText.replace(/"([^"\\]|\\.)*"/g, (match) => {
+      return match
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '\\r')
+        .replace(/\t/g, '\\t')
+        .replace(/[\x00-\x1F\x7F]/g, '')
+    })
+    
     console.log(`[v0] analyzeChunk: Parsing JSON...`)
     const parsed = JSON.parse(jsonText)
     console.log(`[v0] analyzeChunk: Successfully parsed, found ${parsed.clauses?.length || 0} clauses`)
