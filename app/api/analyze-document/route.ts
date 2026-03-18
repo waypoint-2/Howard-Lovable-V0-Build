@@ -256,6 +256,11 @@ export async function POST(request: NextRequest) {
     let documentTitle = ""
 
     for (let i = 0; i < chunks.length; i++) {
+      // Add delay between chunks to avoid rate limit (8000 tokens/min limit)
+      if (i > 0) {
+        console.log(`[v0] Waiting 8s before chunk ${i + 1} to avoid rate limit...`)
+        await new Promise(resolve => setTimeout(resolve, 8000))
+      }
       console.log(`[v0] Processing chunk ${i + 1}/${chunks.length}, length: ${chunks[i].length}`)
       const content: Anthropic.ContentBlockParam[] = [{ type: "text", text: chunks[i] }]
       const result = await analyzeChunk(content, chunks.length > 1, i, chunks.length)
