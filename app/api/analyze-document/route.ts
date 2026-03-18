@@ -224,24 +224,71 @@ async function analyzeChunk(
     }
     jsonText = jsonText.trim()
     
-    // Sanitize control characters inside JSON string values only
-    // This regex finds string contents and escapes control chars within them
-    jsonText = jsonText.replace(/"([^"\\]|\\.)*"/g, (match) => {
-      return match
-        .replace(/\n/g, '\\n')
-        .replace(/\r/g, '\\r')
-        .replace(/\t/g, '\\t')
-        .replace(/[\x00-\x1F\x7F]/g, '')
-    })
-    
     console.log(`[v0] analyzeChunk: Parsing JSON...`)
-    const parsed = JSON.parse(jsonText)
+    
+    // Try to parse as-is first
+    let parsed
+    try {
+      parsed = JSON.parse(jsonText)
+    } catch (parseError) {
+      console.log(`[v0] analyzeChunk: First parse attempt failed, attempting to fix control characters...`)
+      
+      // If that fails, try to fix control characters by going through eval with proper escaping
+      // First, find and escape problematic control characters ONLY within quoted strings
+      try {
+        // Use a more aggressive approach: parse character by character
+        let inString = false
+        let escaped = false
+        let fixed = ''
+        
+        for (let i = 0; i < jsonText.length; i++) {
+          const char = jsonText[i]
+          const code = char.charCodeAt(0)
+          
+          if (escaped) {
+            fixed += char
+            escaped = false
+            continue
+          }
+          
+          if (char === '\\') {
+            fixed += char
+            escaped = true
+            continue
+          }
+          
+          if (char === '"') {
+            inString = !inString
+            fixed += char
+            continue
+          }
+          
+          // If we're inside a string and encounter a control character, escape it
+          if (inString && code >= 0 && code < 32 && code !== 9) {
+            if (code === 10) fixed += '\\n'      // newline
+            else if (code === 13) fixed += '\\r' // carriage return
+            else if (code === 8) fixed += '\\b'  // backspace
+            else if (code === 12) fixed += '\\f' // form feed
+            else fixed += char
+          } else {
+            fixed += char
+          }
+        }
+        
+        parsed = JSON.parse(fixed)
+        console.log(`[v0] analyzeChunk: Fixed and parsed successfully`)
+      } catch (fixError) {
+        console.error(`[v0] analyzeChunk: Could not fix JSON -`, fixError instanceof Error ? fixError.message : fixError)
+        throw parseError
+      }
+    }
     console.log(`[v0] analyzeChunk: Successfully parsed, found ${parsed.clauses?.length || 0} clauses`)
     return parsed
   } catch (error) {
     console.error(`[v0] analyzeChunk: Error -`, error instanceof Error ? error.message : error)
     throw error
   }
+}
 }
 
 export async function POST(request: NextRequest) {
