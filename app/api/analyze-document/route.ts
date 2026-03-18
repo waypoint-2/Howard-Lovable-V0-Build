@@ -224,64 +224,46 @@ async function analyzeChunk(
     }
     jsonText = jsonText.trim()
     
-    console.log(`[v0] analyzeChunk: Parsing JSON...`)
-    
-    // Try to parse as-is first
-    let parsed
-    try {
-      parsed = JSON.parse(jsonText)
-    } catch (parseError) {
-      console.log(`[v0] analyzeChunk: First parse attempt failed, attempting to fix control characters...`)
-      
-      // If that fails, try to fix control characters by going through eval with proper escaping
-      // First, find and escape problematic control characters ONLY within quoted strings
-      try {
-        // Use a more aggressive approach: parse character by character
-        let inString = false
-        let escaped = false
-        let fixed = ''
-        
-        for (let i = 0; i < jsonText.length; i++) {
-          const char = jsonText[i]
-          const code = char.charCodeAt(0)
-          
-          if (escaped) {
-            fixed += char
-            escaped = false
-            continue
-          }
-          
-          if (char === '\\') {
-            fixed += char
-            escaped = true
-            continue
-          }
-          
-          if (char === '"') {
-            inString = !inString
-            fixed += char
-            continue
-          }
-          
-          // If we're inside a string and encounter a control character, escape it
-          if (inString && code >= 0 && code < 32 && code !== 9) {
-            if (code === 10) fixed += '\\n'      // newline
-            else if (code === 13) fixed += '\\r' // carriage return
-            else if (code === 8) fixed += '\\b'  // backspace
-            else if (code === 12) fixed += '\\f' // form feed
-            else fixed += char
-          } else {
-            fixed += char
-          }
+    // Pre-process: sanitize control characters inside JSON string values
+    // before any parse attempt. Walk char-by-char tracking string context.
+    {
+      let inString = false
+      let escaped = false
+      let fixed = ''
+      for (let i = 0; i < jsonText.length; i++) {
+        const char = jsonText[i]
+        const code = char.charCodeAt(0)
+        if (escaped) {
+          fixed += char
+          escaped = false
+          continue
         }
-        
-        parsed = JSON.parse(fixed)
-        console.log(`[v0] analyzeChunk: Fixed and parsed successfully`)
-      } catch (fixError) {
-        console.error(`[v0] analyzeChunk: Could not fix JSON -`, fixError instanceof Error ? fixError.message : fixError)
-        throw parseError
+        if (char === '\\') {
+          fixed += char
+          escaped = true
+          continue
+        }
+        if (char === '"') {
+          inString = !inString
+          fixed += char
+          continue
+        }
+        if (inString && code < 32) {
+          if (code === 10) fixed += '\\n'
+          else if (code === 13) fixed += '\\r'
+          else if (code === 9)  fixed += '\\t'
+          else if (code === 8)  fixed += '\\b'
+          else if (code === 12) fixed += '\\f'
+          // drop all other control chars
+        } else {
+          fixed += char
+        }
       }
+      jsonText = fixed
     }
+    
+    console.log(`[v0] analyzeChunk: Parsing JSON...`)
+    const parsed = JSON.parse(jsonText)
     console.log(`[v0] analyzeChunk: Successfully parsed, found ${parsed.clauses?.length || 0} clauses`)
     return parsed
   } catch (error) {

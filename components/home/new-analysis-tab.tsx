@@ -41,7 +41,9 @@ export function NewAnalysisTab() {
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
+    console.log("[v0] handleFileSelect fired, files:", files?.length)
     if (files && files.length > 0) {
+      console.log("[v0] File selected:", files[0].name, files[0].size)
       setUploadedFile(files[0])
       setUploadState("idle")
       setError(null)
@@ -51,6 +53,7 @@ export function NewAnalysisTab() {
   const handleBrowseClick = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
+    console.log("[v0] handleBrowseClick fired, fileInputRef:", fileInputRef.current)
     fileInputRef.current?.click()
   }, [])
 
