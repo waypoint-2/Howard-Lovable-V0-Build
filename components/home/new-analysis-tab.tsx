@@ -18,6 +18,8 @@ export function NewAnalysisTab() {
   const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
+  const [fileInputKey, setFileInputKey] = useState(0)
+
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragging(true)
@@ -146,7 +148,15 @@ export function NewAnalysisTab() {
     setUploadState("idle")
     setProgress(0)
     setError(null)
+    setFileInputKey((k) => k + 1) // reset input so same file can be re-selected
   }
+
+  const handleAreaClick = useCallback((e: React.MouseEvent) => {
+    // Only trigger if not clicking a button inside the area
+    if ((e.target as HTMLElement).closest('button')) return
+    if (uploadState === "uploading" || uploadState === "analyzing") return
+    fileInputRef.current?.click()
+  }, [uploadState])
 
   return (
     <div className="flex flex-col items-center">
@@ -155,20 +165,22 @@ export function NewAnalysisTab() {
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
+        onClick={handleAreaClick}
         className={cn(
           "w-full max-w-2xl relative rounded-2xl border-2 border-dashed transition-all duration-300",
           "bg-card/50 hover:bg-card",
           uploadState === "uploading" || uploadState === "analyzing"
-            ? "border-[var(--brand)] bg-[var(--brand-light)]"
+            ? "border-[var(--brand)] bg-[var(--brand-light)] cursor-default"
             : isDragging
-              ? "border-[var(--brand)] bg-[var(--brand-light)] scale-[1.02]"
+              ? "border-[var(--brand)] bg-[var(--brand-light)] scale-[1.02] cursor-copy"
               : uploadState === "error"
-                ? "border-[var(--risk-high)] bg-[var(--risk-high-bg)]"
-                : "border-border/60 hover:border-border",
+                ? "border-[var(--risk-high)] bg-[var(--risk-high-bg)] cursor-pointer"
+                : "border-border/60 hover:border-border cursor-pointer",
         )}
       >
         <div className="flex flex-col items-center justify-center py-16 md:py-20">
           <input
+            key={fileInputKey}
             ref={fileInputRef}
             type="file"
             className="hidden"
