@@ -271,7 +271,6 @@ async function analyzeChunk(
     throw error
   }
 }
-}
 
 export async function POST(request: NextRequest) {
   console.log("[v0] POST /api/analyze-document: Starting...")
