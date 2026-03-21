@@ -17,7 +17,8 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 })
 
-const CHUNK_SIZE = 15000
+const MAX_WORDS = 5000
+const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
 
 function extractDocumentTitle(rawText: string): string {
   if (!rawText) return ""
@@ -36,33 +37,8 @@ function extractDocumentTitle(rawText: string): string {
   return lines[0] || ""
 }
 
-function splitIntoChunks(text: string): string[] {
-  if (text.length <= CHUNK_SIZE) return [text]
-  const chunks: string[] = []
-  let remaining = text
-  while (remaining.length > 0) {
-    if (remaining.length <= CHUNK_SIZE) {
-      chunks.push(remaining)
-      break
-    }
-    let breakPoint = CHUNK_SIZE
-    const sectionPatterns = [/\n\d+\.\s+[A-Z]/g, /\nSection\s+\d+/gi, /\nArticle\s+/gi, /\n[A-Z]{3,}[:\s]/g]
-    for (const pattern of sectionPatterns) {
-      const matches = [...remaining.substring(Math.floor(CHUNK_SIZE * 0.7), CHUNK_SIZE).matchAll(pattern)]
-      if (matches.length > 0) {
-        const lastMatch = matches[matches.length - 1]
-        breakPoint = Math.floor(CHUNK_SIZE * 0.7) + (lastMatch.index || 0)
-        break
-      }
-    }
-    if (breakPoint === CHUNK_SIZE) {
-      const paragraphBreak = remaining.lastIndexOf("\n\n", CHUNK_SIZE)
-      if (paragraphBreak > CHUNK_SIZE * 0.5) breakPoint = paragraphBreak
-    }
-    chunks.push(remaining.substring(0, breakPoint))
-    remaining = remaining.substring(breakPoint).trim()
-  }
-  return chunks
+function countWords(text: string): number {
+  return text.trim().split(/\s+/).filter(w => w.length > 0).length
 }
 
 function sanitizeJson(jsonText: string): string {
@@ -144,48 +120,34 @@ Each clause object must have:
 
 Return ONLY valid JSON. No markdown fences.`
 
-const chunkPrompt = (chunkIndex: number, totalChunks: number) =>
-  `Analyze PART ${chunkIndex + 1} of ${totalChunks} of this legal document. Return JSON:
-{
-  "clauses": [clause objects for THIS PART ONLY]
-}
-
-Each clause: id ("clause-N"), clauseNumber ("§ N"), title, humanTitle (4 words), subtitle, originalText (no heading, use markdown), plainMeaning (2-3 sentences), whyMatters (array), riskLevel, favors, commonness.
-
-Return ONLY valid JSON. No markdown fences.`
-
-async function analyzeChunk(
-  content: Anthropic.ContentBlockParam[],
-  isChunk: boolean,
-  chunkIndex: number,
-  totalChunks: number
+async function analyzeDocument(
+  content: Anthropic.ContentBlockParam[]
 ): Promise<{ document_title?: string; clauses: Clause[] }> {
-  console.log(`[v0] analyzeChunk: Starting chunk ${chunkIndex + 1}/${totalChunks}`)
-  console.log(`[v0] analyzeChunk: Calling Claude API...`)
+  console.log(`[v0] analyzeDocument: Calling Claude API...`)
 
   const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 8000,
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 6000,
     system: systemPrompt,
     messages: [
       {
         role: "user",
         content: [
           ...content,
-          { type: "text", text: isChunk ? chunkPrompt(chunkIndex, totalChunks) : userPrompt },
+          { type: "text", text: userPrompt },
         ],
       },
     ],
   })
 
-  console.log(`[v0] analyzeChunk: Claude responded, stop_reason: ${response.stop_reason}`)
+  console.log(`[v0] analyzeDocument: Claude responded, stop_reason: ${response.stop_reason}`)
 
   const textContent = response.content.find((block) => block.type === "text")
   if (!textContent || textContent.type !== "text") {
     throw new Error("No text response from Claude")
   }
 
-  console.log(`[v0] analyzeChunk: Response length: ${textContent.text.length} chars`)
+  console.log(`[v0] analyzeDocument: Response length: ${textContent.text.length} chars`)
 
   // Strip markdown code fences if Claude added them despite instructions
   let jsonText = textContent.text.trim()
@@ -197,9 +159,9 @@ async function analyzeChunk(
   // Sanitize control characters inside string values before parsing
   jsonText = sanitizeJson(jsonText)
 
-  console.log(`[v0] analyzeChunk: Parsing JSON...`)
+  console.log(`[v0] analyzeDocument: Parsing JSON...`)
   const parsed = JSON.parse(jsonText)
-  console.log(`[v0] analyzeChunk: Parsed successfully, clauses: ${parsed.clauses?.length || 0}`)
+  console.log(`[v0] analyzeDocument: Parsed successfully, clauses: ${parsed.clauses?.length || 0}`)
   return parsed
 }
 
@@ -217,69 +179,61 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json()
-    const { rawText, fileBase64, fileType, filename, documentId } = body
+    const { rawText, fileBase64, fileType, filename, documentId, fileSize } = body
     console.log(`[v0] Received: filename=${filename}, hasRawText=${!!rawText}, hasBase64=${!!fileBase64}, textLength=${rawText?.length || 0}`)
 
     if (!rawText && !fileBase64) {
       return NextResponse.json({ error: "No document content provided" }, { status: 400 })
     }
 
+    // Check document size limits
+    if (fileSize && fileSize > MAX_FILE_SIZE) {
+      console.log(`[v0] File too large: ${fileSize} bytes`)
+      return NextResponse.json({
+        error: "This document is too large for a free analysis. Upload a shorter document or upgrade to Howard Pro for full analysis of large documents."
+      }, { status: 413 })
+    }
+
+    if (rawText) {
+      const wordCount = countWords(rawText)
+      console.log(`[v0] Word count: ${wordCount}`)
+      if (wordCount > MAX_WORDS) {
+        console.log(`[v0] Document too long: ${wordCount} words`)
+        return NextResponse.json({
+          error: "This document is too large for a free analysis. Upload a shorter document or upgrade to Howard Pro for full analysis of large documents."
+        }, { status: 413 })
+      }
+    }
+
     const extractedTitle = extractDocumentTitle(rawText || "")
     console.log(`[v0] Extracted title: ${extractedTitle}`)
 
-    // PDF/images — send as base64 directly, no chunking
+    let content: Anthropic.ContentBlockParam[]
+
+    // PDF/images — send as base64 directly
     if (fileBase64) {
       console.log(`[v0] Processing base64 file, type: ${fileType}`)
       const mediaType = fileType === "application/pdf"
         ? "application/pdf"
         : (fileType as "image/jpeg" | "image/png" | "image/gif" | "image/webp")
-      const content: Anthropic.ContentBlockParam[] = [{
+      content = [{
         type: "document",
         source: { type: "base64", media_type: mediaType, data: fileBase64 },
       }]
-      const result = await analyzeChunk(content, false, 0, 1)
-      console.log(`[v0] Base64 analysis complete, clauses: ${result.clauses?.length || 0}`)
-      return NextResponse.json({
-        documentId,
-        filename,
-        document_title: result.document_title || extractedTitle || filename,
-        clauses: result.clauses,
-        analyzedAt: new Date().toISOString(),
-      })
+    } else {
+      // Text content
+      console.log(`[v0] Processing text content`)
+      content = [{ type: "text", text: rawText }]
     }
 
-    // Text — chunk if needed
-    const chunks = splitIntoChunks(rawText)
-    console.log(`[v0] Text split into ${chunks.length} chunk(s)`)
+    const result = await analyzeDocument(content)
+    console.log(`[v0] Analysis complete, clauses: ${result.clauses?.length || 0}`)
 
-    let allClauses: Clause[] = []
-    let documentTitle = ""
-
-    for (let i = 0; i < chunks.length; i++) {
-      // Add delay between chunks to avoid rate limit (8000 tokens/min limit)
-      if (i > 0) {
-        console.log(`[v0] Waiting 8s before chunk ${i + 1} to avoid rate limit...`)
-        await new Promise(resolve => setTimeout(resolve, 8000))
-      }
-      console.log(`[v0] Processing chunk ${i + 1}/${chunks.length}, length: ${chunks[i].length}`)
-      const content: Anthropic.ContentBlockParam[] = [{ type: "text", text: chunks[i] }]
-      const result = await analyzeChunk(content, chunks.length > 1, i, chunks.length)
-      if (i === 0 && result.document_title) documentTitle = result.document_title
-      const renumbered = result.clauses.map((clause, idx) => ({
-        ...clause,
-        id: `clause-${allClauses.length + idx + 1}`,
-        clauseNumber: `§ ${allClauses.length + idx + 1}`,
-      }))
-      allClauses = [...allClauses, ...renumbered]
-      console.log(`[v0] Chunk ${i + 1} done, total clauses: ${allClauses.length}`)
-    }
-
-    console.log(`[v0] Analysis complete, returning ${allClauses.length} clauses`)
     return NextResponse.json({
       documentId,
       filename,
-      document_title: documentTitle || extractedTitle || filename,
-      clauses: allClauses,
+      document_title: result.document_title || extractedTitle || filename,
+      clauses: result.clauses,
       analyzedAt: new Date().toISOString(),
     })
   } catch (error) {
