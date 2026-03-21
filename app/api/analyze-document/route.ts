@@ -109,16 +109,15 @@ Each clause object must have:
 - humanTitle: max 4 words plain English
 - subtitle: e.g. "142 words • high risk"
 - originalText: clause content WITHOUT the section heading as first line. Use markdown: **bold** for defined terms, numbered lists, indented (a) (b) (i) (ii) on separate lines
-- plainMeaning: 2-3 sentence plain English
-- whyMatters: string array, 2-4 bullets
+- plainMeaning: 2 sentences MAX plain English
+- whyMatters: string array, 2 bullets MAX
 - riskLevel: "low" | "medium" | "high"
 - favors: e.g. "Licensor" or "Neutral"
 - commonness: "Standard" | "Aggressive" | "Favorable"
-- notableCharacteristics: optional string array
-- definitions: optional array of { term, plainMeaning, example, importance }
-- questions: optional array of { question, answer, clauseReference }
+- definitions: optional, MAX 2 terms, each with { term, plainMeaning (1 sentence), example, importance }
+- questions: optional, MAX 1 question with { question, answer, clauseReference }
 
-Return ONLY valid JSON. No markdown fences.`
+Be concise. Return ONLY valid JSON. No markdown fences.`
 
 async function analyzeDocument(
   content: Anthropic.ContentBlockParam[]
@@ -127,7 +126,7 @@ async function analyzeDocument(
 
   const response = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 8000,
+    max_tokens: 16000,
     system: systemPrompt,
     messages: [
       {
