@@ -127,7 +127,7 @@ async function analyzeDocument(
 
   const response = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 6000,
+    max_tokens: 8000,
     system: systemPrompt,
     messages: [
       {
@@ -141,6 +141,12 @@ async function analyzeDocument(
   })
 
   console.log(`[v0] analyzeDocument: Claude responded, stop_reason: ${response.stop_reason}`)
+  
+  // If response was cut off due to token limit, the JSON will be incomplete
+  if (response.stop_reason === "max_tokens") {
+    console.error("[v0] analyzeDocument: Response was truncated due to max_tokens limit")
+    throw new Error("Response truncated - document may be too complex. Try a shorter document.")
+  }
 
   const textContent = response.content.find((block) => block.type === "text")
   if (!textContent || textContent.type !== "text") {
@@ -148,6 +154,8 @@ async function analyzeDocument(
   }
 
   console.log(`[v0] analyzeDocument: Response length: ${textContent.text.length} chars`)
+  console.log(`[v0] analyzeDocument: Raw response (first 500 chars): ${textContent.text.substring(0, 500)}`)
+  console.log(`[v0] analyzeDocument: Raw response (last 500 chars): ${textContent.text.substring(textContent.text.length - 500)}`)
 
   // Strip markdown code fences if Claude added them despite instructions
   let jsonText = textContent.text.trim()
