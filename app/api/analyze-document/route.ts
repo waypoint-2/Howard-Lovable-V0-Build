@@ -150,6 +150,8 @@ async function analyzeWithGemini(
 
   console.log(`[v0] analyzeWithGemini: Response length: ${responseText.length} chars`)
 
+  const wasTruncated = finishReason === "MAX_TOKENS" || finishReason === "LENGTH"
+  
   let parsed
   try {
     let jsonText = responseText.trim()
@@ -157,13 +159,18 @@ async function analyzeWithGemini(
     else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3)
     if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
     jsonText = sanitizeJson(jsonText.trim())
+    
+    // If truncated, try to repair the JSON by closing open structures
+    if (wasTruncated) {
+      console.log(`[v0] Response was truncated, attempting JSON repair...`)
+      jsonText = repairTruncatedJson(jsonText)
+    }
+    
     parsed = JSON.parse(jsonText)
   } catch (e) {
     console.error(`[v0] Failed to parse Gemini response:`, responseText.substring(0, 500))
     throw new Error("Failed to parse AI response")
   }
-
-  const wasTruncated = finishReason === "MAX_TOKENS" || finishReason === "LENGTH"
   
   console.log(`[v0] analyzeWithGemini: Parsed successfully, clauses: ${parsed.clauses?.length || 0}, truncated: ${wasTruncated}`)
   return { ...parsed, wasTruncated }
