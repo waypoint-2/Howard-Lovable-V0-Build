@@ -111,7 +111,7 @@ async function analyzeDocument(
           : userPrompt,
       },
     ],
-    max_tokens: 8000,
+    max_tokens: 16000,
     response_format: {
       type: "json_schema",
       json_schema: {
