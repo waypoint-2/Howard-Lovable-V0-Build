@@ -159,7 +159,7 @@ async function analyzeDocument(
                     items: {
                       type: "object",
                       additionalProperties: false,
-                      required: ["question", "answer"],
+                      required: ["question", "answer", "clauseReference"],
                       properties: {
                         question: { type: "string" },
                         answer: { type: "string" },
