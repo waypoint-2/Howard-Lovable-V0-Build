@@ -77,7 +77,31 @@ Each clause object must have:
 - definitions: optional, MAX 2 terms, each with { term, plainMeaning (1 sentence), example, importance }
 - questions: optional, MAX 1 question with { question, answer, clauseReference }
 
-Be concise. Return ONLY valid JSON. No markdown fences.`
+Be concise. Return ONLY valid JSON. No markdown fences. Return ONLY a valid JSON object starting with {. No markdown, no code fences, no preamble.`
+
+function sanitizeJson(text: string): string {
+  let inString = false
+  let escaped = false
+  let fixed = ""
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    const code = char.charCodeAt(0)
+    if (escaped) { fixed += char; escaped = false; continue }
+    if (char === "\\") { fixed += char; escaped = true; continue }
+    if (char === '"') { inString = !inString; fixed += char; continue }
+    if (inString && code < 32) {
+      if (code === 10) fixed += "\\n"
+      else if (code === 13) fixed += "\\r"
+      else if (code === 9) fixed += "\\t"
+      else if (code === 8) fixed += "\\b"
+      else if (code === 12) fixed += "\\f"
+      // drop other control chars
+    } else {
+      fixed += char
+    }
+  }
+  return fixed
+}
 
 async function analyzeDocument(
   content: string,
@@ -112,69 +136,7 @@ async function analyzeDocument(
       },
     ],
     max_tokens: 16000,
-    response_format: {
-      type: "json_schema",
-      json_schema: {
-        name: "legal_analysis",
-        strict: true,
-        schema: {
-          type: "object",
-          properties: {
-            document_title: { type: "string" },
-            clauses: {
-              type: "array",
-              items: {
-                type: "object",
-                additionalProperties: false,
-                required: ["id", "clauseNumber", "title", "humanTitle", "subtitle", "originalText", "plainMeaning", "whyMatters", "riskLevel", "favors", "commonness", "notableCharacteristics", "definitions", "questions"],
-                properties: {
-                  id: { type: "string" },
-                  clauseNumber: { type: "string" },
-                  title: { type: "string" },
-                  humanTitle: { type: "string" },
-                  subtitle: { type: "string" },
-                  originalText: { type: "string" },
-                  plainMeaning: { type: "string" },
-                  whyMatters: { type: "array", items: { type: "string" } },
-                  riskLevel: { type: "string", enum: ["low", "medium", "high"] },
-                  favors: { type: "string" },
-                  commonness: { type: "string" },
-                  notableCharacteristics: { type: "array", items: { type: "string" } },
-                  definitions: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      additionalProperties: false,
-                      required: ["term", "plainMeaning", "example", "importance"],
-                      properties: {
-                        term: { type: "string" },
-                        plainMeaning: { type: "string" },
-                        example: { type: "string" },
-                        importance: { type: "string" },
-                      },
-                    },
-                  },
-                  questions: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      additionalProperties: false,
-                      required: ["question", "answer", "clauseReference"],
-                      properties: {
-                        question: { type: "string" },
-                        answer: { type: "string" },
-                        clauseReference: { type: "string" },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-          },
-          required: ["clauses"],
-        },
-      },
-    },
+    response_format: { type: "json_object" },
   }
 
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -202,9 +164,15 @@ async function analyzeDocument(
 
   let parsed
   try {
-    parsed = JSON.parse(message.content)
+    // Strip code fences if present, sanitize control chars, then parse
+    let jsonText = message.content.trim()
+    if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7)
+    else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3)
+    if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
+    jsonText = sanitizeJson(jsonText.trim())
+    parsed = JSON.parse(jsonText)
   } catch (e) {
-    console.error(`[v0] Failed to parse Groq response:`, message.content)
+    console.error(`[v0] Failed to parse Groq response:`, message.content?.substring(0, 500))
     throw new Error("Failed to parse AI response")
   }
 
