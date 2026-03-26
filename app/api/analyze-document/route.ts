@@ -1,5 +1,4 @@
 import { NextResponse, type NextRequest } from "next/server"
-import Anthropic from "@anthropic-ai/sdk"
 import { Ratelimit } from "@upstash/ratelimit"
 import { Redis } from "@upstash/redis"
 
@@ -11,10 +10,6 @@ const redis = new Redis({
 const ratelimit = new Ratelimit({
   redis: redis,
   limiter: Ratelimit.slidingWindow(10, "1 h"),
-})
-
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
 })
 
 const MAX_WORDS = 5000
@@ -41,42 +36,6 @@ function countWords(text: string): number {
   return text.trim().split(/\s+/).filter(w => w.length > 0).length
 }
 
-function sanitizeJson(jsonText: string): string {
-  let inString = false
-  let escaped = false
-  let fixed = ""
-  for (let i = 0; i < jsonText.length; i++) {
-    const char = jsonText[i]
-    const code = char.charCodeAt(0)
-    if (escaped) {
-      fixed += char
-      escaped = false
-      continue
-    }
-    if (char === "\\") {
-      fixed += char
-      escaped = true
-      continue
-    }
-    if (char === '"') {
-      inString = !inString
-      fixed += char
-      continue
-    }
-    if (inString && code < 32) {
-      if (code === 10) fixed += "\\n"
-      else if (code === 13) fixed += "\\r"
-      else if (code === 9) fixed += "\\t"
-      else if (code === 8) fixed += "\\b"
-      else if (code === 12) fixed += "\\f"
-      // drop all other control chars
-    } else {
-      fixed += char
-    }
-  }
-  return fixed
-}
-
 interface Clause {
   id: string
   clauseNumber: string
@@ -92,6 +51,7 @@ interface Clause {
   notableCharacteristics?: string[]
   definitions?: Array<{ term: string; plainMeaning: string; example: string; importance: string }>
   questions?: Array<{ question: string; answer: string; clauseReference: string }>
+  truncated?: boolean
 }
 
 const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk. Return valid JSON only. No preamble, no markdown fences, just the JSON object.`
@@ -120,54 +80,140 @@ Each clause object must have:
 Be concise. Return ONLY valid JSON. No markdown fences.`
 
 async function analyzeDocument(
-  content: Anthropic.ContentBlockParam[]
+  content: string,
+  isBase64: boolean = false,
+  mediaType: string = ""
 ): Promise<{ document_title?: string; clauses: Clause[] }> {
-  console.log(`[v0] analyzeDocument: Calling Claude API...`)
+  console.log(`[v0] analyzeDocument: Calling Groq API...`)
 
-  const response = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 16000,
-    system: systemPrompt,
+  const requestBody = {
+    model: "gpt-oss-2b-json-tool",
     messages: [
       {
+        role: "system",
+        content: systemPrompt,
+      },
+      {
         role: "user",
-        content: [
-          ...content,
-          { type: "text", text: userPrompt },
-        ],
+        content: isBase64
+          ? [
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:${mediaType};base64,${content}`,
+                },
+              },
+              {
+                type: "text",
+                text: userPrompt,
+              },
+            ]
+          : userPrompt,
       },
     ],
+    max_tokens: 8000,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "legal_analysis",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            document_title: { type: "string" },
+            clauses: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["id", "clauseNumber", "title", "humanTitle", "subtitle", "originalText", "plainMeaning", "whyMatters", "riskLevel", "favors", "commonness"],
+                properties: {
+                  id: { type: "string" },
+                  clauseNumber: { type: "string" },
+                  title: { type: "string" },
+                  humanTitle: { type: "string" },
+                  subtitle: { type: "string" },
+                  originalText: { type: "string" },
+                  plainMeaning: { type: "string" },
+                  whyMatters: { type: "array", items: { type: "string" } },
+                  riskLevel: { type: "string", enum: ["low", "medium", "high"] },
+                  favors: { type: "string" },
+                  commonness: { type: "string" },
+                  notableCharacteristics: { type: "array", items: { type: "string" } },
+                  definitions: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["term", "plainMeaning", "example", "importance"],
+                      properties: {
+                        term: { type: "string" },
+                        plainMeaning: { type: "string" },
+                        example: { type: "string" },
+                        importance: { type: "string" },
+                      },
+                    },
+                  },
+                  questions: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["question", "answer"],
+                      properties: {
+                        question: { type: "string" },
+                        answer: { type: "string" },
+                        clauseReference: { type: "string" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          required: ["clauses"],
+        },
+      },
+    },
+  }
+
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify(requestBody),
   })
 
-  console.log(`[v0] analyzeDocument: Claude responded, stop_reason: ${response.stop_reason}`)
-  
-  // If response was cut off due to token limit, the JSON will be incomplete
-  if (response.stop_reason === "max_tokens") {
-    console.error("[v0] analyzeDocument: Response was truncated due to max_tokens limit")
-    throw new Error("Response truncated - document may be too complex. Try a shorter document.")
+  if (!response.ok) {
+    const errorText = await response.text()
+    console.error(`[v0] Groq API error: ${response.status} - ${errorText}`)
+    throw new Error(`Groq API error: ${response.status}`)
   }
 
-  const textContent = response.content.find((block) => block.type === "text")
-  if (!textContent || textContent.type !== "text") {
-    throw new Error("No text response from Claude")
+  const data = await response.json()
+  console.log(`[v0] analyzeDocument: Groq responded, stop_reason: ${data.choices?.[0]?.finish_reason}`)
+
+  const message = data.choices?.[0]?.message
+  if (!message?.content) {
+    throw new Error("No content in Groq response")
   }
 
-  console.log(`[v0] analyzeDocument: Response length: ${textContent.text.length} chars`)
-  console.log(`[v0] analyzeDocument: Raw response (first 500 chars): ${textContent.text.substring(0, 500)}`)
-  console.log(`[v0] analyzeDocument: Raw response (last 500 chars): ${textContent.text.substring(textContent.text.length - 500)}`)
+  let parsed
+  try {
+    parsed = JSON.parse(message.content)
+  } catch (e) {
+    console.error(`[v0] Failed to parse Groq response:`, message.content)
+    throw new Error("Failed to parse AI response")
+  }
 
-  // Strip markdown code fences if Claude added them despite instructions
-  let jsonText = textContent.text.trim()
-  if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7)
-  else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3)
-  if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
-  jsonText = jsonText.trim()
+  // Check if response was truncated
+  if (data.choices?.[0]?.finish_reason === "length" && parsed.clauses?.length > 0) {
+    console.log("[v0] Response was truncated (length), marking last clause")
+    parsed.clauses[parsed.clauses.length - 1].truncated = true
+  }
 
-  // Sanitize control characters inside string values before parsing
-  jsonText = sanitizeJson(jsonText)
-
-  console.log(`[v0] analyzeDocument: Parsing JSON...`)
-  const parsed = JSON.parse(jsonText)
   console.log(`[v0] analyzeDocument: Parsed successfully, clauses: ${parsed.clauses?.length || 0}`)
   return parsed
 }
@@ -215,25 +261,15 @@ export async function POST(request: NextRequest) {
     const extractedTitle = extractDocumentTitle(rawText || "")
     console.log(`[v0] Extracted title: ${extractedTitle}`)
 
-    let content: Anthropic.ContentBlockParam[]
-
-    // PDF/images — send as base64 directly
+    let result
     if (fileBase64) {
       console.log(`[v0] Processing base64 file, type: ${fileType}`)
-      const mediaType = fileType === "application/pdf"
-        ? "application/pdf"
-        : (fileType as "image/jpeg" | "image/png" | "image/gif" | "image/webp")
-      content = [{
-        type: "document",
-        source: { type: "base64", media_type: mediaType, data: fileBase64 },
-      }]
+      result = await analyzeDocument(fileBase64, true, fileType || "application/pdf")
     } else {
-      // Text content
       console.log(`[v0] Processing text content`)
-      content = [{ type: "text", text: rawText }]
+      result = await analyzeDocument(rawText, false)
     }
 
-    const result = await analyzeDocument(content)
     console.log(`[v0] Analysis complete, clauses: ${result.clauses?.length || 0}`)
 
     return NextResponse.json({
@@ -252,11 +288,9 @@ export async function POST(request: NextRequest) {
       if (error.message.includes("rate limit") || error.message.includes("429")) {
         errorMessage = "API rate limit reached. Please try again in a few minutes."
         statusCode = 429
-      } else if (error.message.includes("credit") || error.message.includes("billing")) {
-        errorMessage = "API billing issue. Please check your Anthropic account."
-        statusCode = 402
-      } else if (error.message.includes("JSON") || error.message.includes("control character")) {
-        errorMessage = "Failed to parse AI response. Please try again."
+      } else if (error.message.includes("Groq API error")) {
+        errorMessage = "AI service error. Please try again."
+        statusCode = 500
       } else {
         errorMessage = `Analysis failed: ${error.message}`
       }
