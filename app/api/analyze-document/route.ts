@@ -126,7 +126,7 @@ async function analyzeDocument(
               items: {
                 type: "object",
                 additionalProperties: false,
-                required: ["id", "clauseNumber", "title", "humanTitle", "subtitle", "originalText", "plainMeaning", "whyMatters", "riskLevel", "favors", "commonness"],
+                required: ["id", "clauseNumber", "title", "humanTitle", "subtitle", "originalText", "plainMeaning", "whyMatters", "riskLevel", "favors", "commonness", "notableCharacteristics", "definitions", "questions"],
                 properties: {
                   id: { type: "string" },
                   clauseNumber: { type: "string" },
