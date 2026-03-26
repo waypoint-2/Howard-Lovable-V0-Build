@@ -104,9 +104,7 @@ function sanitizeJson(text: string): string {
 }
 
 async function analyzeDocument(
-  content: string,
-  isBase64: boolean = false,
-  mediaType: string = ""
+  documentText: string
 ): Promise<{ document_title?: string; clauses: Clause[] }> {
   console.log(`[v0] analyzeDocument: Calling Groq API...`)
 
@@ -119,20 +117,7 @@ async function analyzeDocument(
       },
       {
         role: "user",
-        content: isBase64
-          ? [
-              {
-                type: "image_url",
-                image_url: {
-                  url: `data:${mediaType};base64,${content}`,
-                },
-              },
-              {
-                type: "text",
-                text: userPrompt,
-              },
-            ]
-          : userPrompt,
+        content: `${userPrompt}\n\n--- DOCUMENT START ---\n${documentText}\n--- DOCUMENT END ---`,
       },
     ],
     max_tokens: 16000,
@@ -230,13 +215,16 @@ export async function POST(request: NextRequest) {
     console.log(`[v0] Extracted title: ${extractedTitle}`)
 
     let result
-    if (fileBase64) {
-      console.log(`[v0] Processing base64 file, type: ${fileType}`)
-      result = await analyzeDocument(fileBase64, true, fileType || "application/pdf")
-    } else {
-      console.log(`[v0] Processing text content`)
-      result = await analyzeDocument(rawText, false)
+    if (fileBase64 && !rawText) {
+      // Groq doesn't support base64/PDF input - require text extraction
+      console.log(`[v0] Base64 file without rawText - cannot process`)
+      return NextResponse.json({
+        error: "PDF analysis requires text extraction. Please try uploading a .txt or .docx file, or copy-paste the document text."
+      }, { status: 400 })
     }
+    
+    console.log(`[v0] Processing text content, length: ${rawText?.length || 0}`)
+    result = await analyzeDocument(rawText)
 
     console.log(`[v0] Analysis complete, clauses: ${result.clauses?.length || 0}`)
 
