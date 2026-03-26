@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { Ratelimit } from "@upstash/ratelimit"
 import { Redis } from "@upstash/redis"
+import { GoogleGenAI } from "@google/genai"
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -11,6 +12,8 @@ const ratelimit = new Ratelimit({
   redis: redis,
   limiter: Ratelimit.slidingWindow(10, "1 h"),
 })
+
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! })
 
 const MAX_WORDS = 5000
 const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
@@ -95,7 +98,6 @@ function sanitizeJson(text: string): string {
       else if (code === 9) fixed += "\\t"
       else if (code === 8) fixed += "\\b"
       else if (code === 12) fixed += "\\f"
-      // drop other control chars
     } else {
       fixed += char
     }
@@ -103,72 +105,68 @@ function sanitizeJson(text: string): string {
   return fixed
 }
 
-async function analyzeDocument(
-  documentText: string
-): Promise<{ document_title?: string; clauses: Clause[] }> {
-  console.log(`[v0] analyzeDocument: Calling Groq API...`)
+async function analyzeWithGemini(
+  content: { text?: string; base64?: string; mimeType?: string }
+): Promise<{ document_title?: string; clauses: Clause[]; wasTruncated: boolean }> {
+  console.log(`[v0] analyzeWithGemini: Calling Gemini API...`)
 
-  const requestBody = {
-    model: "openai/gpt-oss-20b",
-    messages: [
-      {
-        role: "system",
-        content: systemPrompt,
+  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = []
+
+  // Add the prompt
+  parts.push({ text: `${systemPrompt}\n\n${userPrompt}\n\n--- DOCUMENT START ---` })
+
+  // Add document content
+  if (content.base64 && content.mimeType) {
+    console.log(`[v0] Sending as inline base64, mimeType: ${content.mimeType}`)
+    parts.push({
+      inlineData: {
+        mimeType: content.mimeType,
+        data: content.base64,
       },
-      {
-        role: "user",
-        content: `${userPrompt}\n\n--- DOCUMENT START ---\n${documentText}\n--- DOCUMENT END ---`,
-      },
-    ],
-    max_tokens: 16000,
-    response_format: { type: "json_object" },
+    })
+  } else if (content.text) {
+    console.log(`[v0] Sending as plain text, length: ${content.text.length}`)
+    parts.push({ text: content.text })
   }
 
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+  parts.push({ text: "--- DOCUMENT END ---" })
+
+  const response = await genAI.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [{ role: "user", parts }],
+    config: {
+      responseMimeType: "application/json",
+      maxOutputTokens: 16000,
     },
-    body: JSON.stringify(requestBody),
   })
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    console.error(`[v0] Groq API error: ${response.status} - ${errorText}`)
-    throw new Error(`Groq API error: ${response.status}`)
+  const finishReason = response.candidates?.[0]?.finishReason
+  console.log(`[v0] analyzeWithGemini: Gemini responded, finishReason: ${finishReason}`)
+
+  const responseText = response.text
+  if (!responseText) {
+    throw new Error("No content in Gemini response")
   }
 
-  const data = await response.json()
-  console.log(`[v0] analyzeDocument: Groq responded, stop_reason: ${data.choices?.[0]?.finish_reason}`)
-
-  const message = data.choices?.[0]?.message
-  if (!message?.content) {
-    throw new Error("No content in Groq response")
-  }
+  console.log(`[v0] analyzeWithGemini: Response length: ${responseText.length} chars`)
 
   let parsed
   try {
-    // Strip code fences if present, sanitize control chars, then parse
-    let jsonText = message.content.trim()
+    let jsonText = responseText.trim()
     if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7)
     else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3)
     if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
     jsonText = sanitizeJson(jsonText.trim())
     parsed = JSON.parse(jsonText)
   } catch (e) {
-    console.error(`[v0] Failed to parse Groq response:`, message.content?.substring(0, 500))
+    console.error(`[v0] Failed to parse Gemini response:`, responseText.substring(0, 500))
     throw new Error("Failed to parse AI response")
   }
 
-  // Check if response was truncated
-  if (data.choices?.[0]?.finish_reason === "length" && parsed.clauses?.length > 0) {
-    console.log("[v0] Response was truncated (length), marking last clause")
-    parsed.clauses[parsed.clauses.length - 1].truncated = true
-  }
-
-  console.log(`[v0] analyzeDocument: Parsed successfully, clauses: ${parsed.clauses?.length || 0}`)
-  return parsed
+  const wasTruncated = finishReason === "MAX_TOKENS" || finishReason === "LENGTH"
+  
+  console.log(`[v0] analyzeWithGemini: Parsed successfully, clauses: ${parsed.clauses?.length || 0}, truncated: ${wasTruncated}`)
+  return { ...parsed, wasTruncated }
 }
 
 export async function POST(request: NextRequest) {
@@ -215,16 +213,25 @@ export async function POST(request: NextRequest) {
     console.log(`[v0] Extracted title: ${extractedTitle}`)
 
     let result
-    if (fileBase64 && !rawText) {
-      // Groq doesn't support base64/PDF input - require text extraction
-      console.log(`[v0] Base64 file without rawText - cannot process`)
-      return NextResponse.json({
-        error: "PDF analysis requires text extraction. Please try uploading a .txt or .docx file, or copy-paste the document text."
-      }, { status: 400 })
-    }
     
-    console.log(`[v0] Processing text content, length: ${rawText?.length || 0}`)
-    result = await analyzeDocument(rawText)
+    // For PDFs and images, send as base64 inline data
+    if (fileBase64 && fileType) {
+      console.log(`[v0] Processing base64 file, type: ${fileType}`)
+      result = await analyzeWithGemini({
+        base64: fileBase64,
+        mimeType: fileType,
+      })
+    } else {
+      // For DOCX/TXT, send as plain text
+      console.log(`[v0] Processing text content, length: ${rawText?.length || 0}`)
+      result = await analyzeWithGemini({ text: rawText })
+    }
+
+    // If response was truncated, mark the last clause
+    if (result.wasTruncated && result.clauses?.length > 0) {
+      console.log("[v0] Response was truncated, marking last clause")
+      result.clauses[result.clauses.length - 1].truncated = true
+    }
 
     console.log(`[v0] Analysis complete, clauses: ${result.clauses?.length || 0}`)
 
@@ -241,11 +248,11 @@ export async function POST(request: NextRequest) {
     let statusCode = 500
     if (error instanceof Error) {
       console.error(`[v0] Error: ${error.name} - ${error.message}`)
-      if (error.message.includes("rate limit") || error.message.includes("429")) {
+      if (error.message.includes("rate limit") || error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
         errorMessage = "API rate limit reached. Please try again in a few minutes."
         statusCode = 429
-      } else if (error.message.includes("Groq API error")) {
-        errorMessage = "AI service error. Please try again."
+      } else if (error.message.includes("API key")) {
+        errorMessage = "AI service configuration error. Please contact support."
         statusCode = 500
       } else {
         errorMessage = `Analysis failed: ${error.message}`
