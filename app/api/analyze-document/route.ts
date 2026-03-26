@@ -17,6 +17,7 @@ const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! })
 
 const MAX_WORDS = 5000
 const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
+const BATCH_SIZE = 4
 
 function extractDocumentTitle(rawText: string): string {
   if (!rawText) return ""
@@ -39,6 +40,11 @@ function countWords(text: string): number {
   return text.trim().split(/\s+/).filter(w => w.length > 0).length
 }
 
+interface ClauseOutline {
+  id: string
+  title: string
+}
+
 interface Clause {
   id: string
   clauseNumber: string
@@ -57,16 +63,21 @@ interface Clause {
   truncated?: boolean
 }
 
-const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk. Return valid JSON only. No preamble, no markdown fences, just the JSON object.`
+const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk. Return valid JSON only. No preamble, no markdown fences, just the JSON.`
 
-const userPrompt = `Analyze this legal document and return a JSON object:
+const outlinePrompt = `Identify all clauses/sections in this legal document. Return a JSON array of objects, each with:
+- id: "clause-N" (sequential numbering)
+- title: the exact section heading from the document
+
+Return ONLY a valid JSON array starting with [. No markdown, no code fences, no preamble.`
+
+const batchAnalysisPrompt = `Analyze ONLY the following clauses from this legal document. Return a JSON object with:
 {
-  "document_title": "actual document title/heading from the document",
-  "clauses": [array of clause objects]
+  "clauses": [array of clause objects for the specified clauses ONLY]
 }
 
 Each clause object must have:
-- id: "clause-N"
+- id: use the id provided below
 - clauseNumber: "§ N"
 - title: original legal heading
 - humanTitle: max 4 words plain English
@@ -80,48 +91,7 @@ Each clause object must have:
 - definitions: optional, MAX 2 terms, each with { term, plainMeaning (1 sentence), example, importance }
 - questions: optional, MAX 1 question with { question, answer, clauseReference }
 
-Be concise. Return ONLY valid JSON. No markdown fences. Return ONLY a valid JSON object starting with {. No markdown, no code fences, no preamble.`
-
-// Repair truncated JSON by closing open brackets, braces, and strings
-function repairTruncatedJson(text: string): string {
-  let result = text.trim()
-  
-  // If we're inside a string, close it
-  let inString = false
-  let escaped = false
-  for (let i = 0; i < result.length; i++) {
-    const char = result[i]
-    if (escaped) { escaped = false; continue }
-    if (char === '\\') { escaped = true; continue }
-    if (char === '"') inString = !inString
-  }
-  if (inString) result += '"'
-  
-  // Count open brackets and braces
-  let openBraces = 0
-  let openBrackets = 0
-  inString = false
-  escaped = false
-  for (let i = 0; i < result.length; i++) {
-    const char = result[i]
-    if (escaped) { escaped = false; continue }
-    if (char === '\\') { escaped = true; continue }
-    if (char === '"') { inString = !inString; continue }
-    if (inString) continue
-    if (char === '{') openBraces++
-    if (char === '}') openBraces--
-    if (char === '[') openBrackets++
-    if (char === ']') openBrackets--
-  }
-  
-  // Close any open structures
-  // First close arrays (usually inside objects)
-  while (openBrackets > 0) { result += ']'; openBrackets-- }
-  // Then close objects
-  while (openBraces > 0) { result += '}'; openBraces-- }
-  
-  return result
-}
+ANALYZE ONLY THESE CLAUSES:`
 
 function sanitizeJson(text: string): string {
   let inString = false
@@ -146,19 +116,21 @@ function sanitizeJson(text: string): string {
   return fixed
 }
 
-async function analyzeWithGemini(
+function parseJsonResponse(responseText: string): unknown {
+  let jsonText = responseText.trim()
+  if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7)
+  else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3)
+  if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
+  jsonText = sanitizeJson(jsonText.trim())
+  return JSON.parse(jsonText)
+}
+
+function buildDocumentParts(
   content: { text?: string; base64?: string; mimeType?: string }
-): Promise<{ document_title?: string; clauses: Clause[]; wasTruncated: boolean }> {
-  console.log(`[v0] analyzeWithGemini: Calling Gemini API...`)
-
+): Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> {
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = []
-
-  // Add the prompt
-  parts.push({ text: `${systemPrompt}\n\n${userPrompt}\n\n--- DOCUMENT START ---` })
-
-  // Add document content
+  
   if (content.base64 && content.mimeType) {
-    console.log(`[v0] Sending as inline base64, mimeType: ${content.mimeType}`)
     parts.push({
       inlineData: {
         mimeType: content.mimeType,
@@ -166,84 +138,123 @@ async function analyzeWithGemini(
       },
     })
   } else if (content.text) {
-    console.log(`[v0] Sending as plain text, length: ${content.text.length}`)
     parts.push({ text: content.text })
   }
+  
+  return parts
+}
 
-  parts.push({ text: "--- DOCUMENT END ---" })
+// Pass 1: Get clause outline
+async function getClauseOutline(
+  content: { text?: string; base64?: string; mimeType?: string }
+): Promise<{ outline: ClauseOutline[]; documentTitle: string }> {
+  console.log(`[v0] Pass 1: Getting clause outline...`)
+
+  const documentParts = buildDocumentParts(content)
+  const parts = [
+    { text: `${systemPrompt}\n\n${outlinePrompt}\n\n--- DOCUMENT START ---` },
+    ...documentParts,
+    { text: "--- DOCUMENT END ---" },
+  ]
 
   const response = await genAI.models.generateContent({
     model: "gemini-2.5-flash",
     contents: [{ role: "user", parts }],
     config: {
       responseMimeType: "application/json",
-      maxOutputTokens: 32000,
+      maxOutputTokens: 4000,
     },
   })
 
-  const finishReason = response.candidates?.[0]?.finishReason
-  console.log(`[v0] analyzeWithGemini: Gemini responded, finishReason: ${finishReason}`)
+  const responseText = response.text
+  if (!responseText) throw new Error("No content in outline response")
+
+  console.log(`[v0] Pass 1: Response length: ${responseText.length} chars`)
+
+  const parsed = parseJsonResponse(responseText)
+  
+  let outline: ClauseOutline[]
+  if (Array.isArray(parsed)) {
+    outline = parsed as ClauseOutline[]
+  } else if (typeof parsed === 'object' && parsed !== null && 'clauses' in parsed) {
+    outline = (parsed as { clauses: ClauseOutline[] }).clauses
+  } else {
+    throw new Error("Invalid outline format")
+  }
+
+  // Extract document title from first line if present
+  let documentTitle = ""
+  if (typeof parsed === 'object' && parsed !== null && 'document_title' in parsed) {
+    documentTitle = (parsed as { document_title: string }).document_title
+  }
+
+  console.log(`[v0] Pass 1: Found ${outline.length} clauses`)
+  return { outline, documentTitle }
+}
+
+// Pass 2: Analyze a batch of clauses
+async function analyzeBatch(
+  content: { text?: string; base64?: string; mimeType?: string },
+  batch: ClauseOutline[]
+): Promise<Clause[]> {
+  const clauseList = batch.map(c => `- ${c.id}: "${c.title}"`).join("\n")
+  console.log(`[v0] Pass 2: Analyzing batch of ${batch.length} clauses`)
+
+  const documentParts = buildDocumentParts(content)
+  const parts = [
+    { text: `${systemPrompt}\n\n${batchAnalysisPrompt}\n${clauseList}\n\nBe concise. Return ONLY valid JSON. No markdown fences.\n\n--- DOCUMENT START ---` },
+    ...documentParts,
+    { text: "--- DOCUMENT END ---" },
+  ]
+
+  const response = await genAI.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [{ role: "user", parts }],
+    config: {
+      responseMimeType: "application/json",
+      maxOutputTokens: 16000,
+    },
+  })
 
   const responseText = response.text
-  if (!responseText) {
-    throw new Error("No content in Gemini response")
+  if (!responseText) throw new Error("No content in batch response")
+
+  console.log(`[v0] Pass 2: Batch response length: ${responseText.length} chars`)
+
+  const parsed = parseJsonResponse(responseText)
+  
+  let clauses: Clause[]
+  if (Array.isArray(parsed)) {
+    clauses = parsed as Clause[]
+  } else if (typeof parsed === 'object' && parsed !== null && 'clauses' in parsed) {
+    clauses = (parsed as { clauses: Clause[] }).clauses
+  } else {
+    throw new Error("Invalid batch response format")
   }
 
-  console.log(`[v0] analyzeWithGemini: Response length: ${responseText.length} chars`)
-
-  const wasTruncated = finishReason === "MAX_TOKENS" || finishReason === "LENGTH"
-  
-  let parsed
-  try {
-    let jsonText = responseText.trim()
-    if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7)
-    else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3)
-    if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
-    jsonText = sanitizeJson(jsonText.trim())
-    
-    const rawParsed = JSON.parse(jsonText)
-    
-    // Handle both formats: plain array or wrapped object with clauses property
-    if (Array.isArray(rawParsed)) {
-      parsed = { clauses: rawParsed }
-    } else if (rawParsed.clauses && Array.isArray(rawParsed.clauses)) {
-      parsed = rawParsed
-    } else {
-      throw new Error("Response is neither an array nor has a clauses property")
-    }
-  } catch (e) {
-    console.error(`[v0] Failed to parse Gemini response:`, responseText.substring(0, 500))
-    throw new Error("Failed to parse AI response")
-  }
-  
-  console.log(`[v0] analyzeWithGemini: Parsed successfully, clauses: ${parsed.clauses?.length || 0}, truncated: ${wasTruncated}`)
-  return { ...parsed, wasTruncated }
+  console.log(`[v0] Pass 2: Batch returned ${clauses.length} clauses`)
+  return clauses
 }
 
 export async function POST(request: NextRequest) {
-  console.log("[v0] POST /api/analyze-document: Starting...")
+  console.log("[v0] POST /api/analyze-document: Starting streaming analysis...")
 
   try {
     const ip = request.headers.get("x-forwarded-for") || "unknown"
-    console.log(`[v0] Rate limit check for IP: ${ip}`)
     const { success } = await ratelimit.limit(ip)
 
     if (!success) {
-      console.log("[v0] Rate limit exceeded")
       return NextResponse.json({ error: "Rate limit exceeded. Maximum 10 analyses per hour." }, { status: 429 })
     }
 
     const body = await request.json()
     const { rawText, fileBase64, fileType, filename, documentId, fileSize } = body
-    console.log(`[v0] Received: filename=${filename}, hasRawText=${!!rawText}, hasBase64=${!!fileBase64}, textLength=${rawText?.length || 0}`)
 
     if (!rawText && !fileBase64) {
       return NextResponse.json({ error: "No document content provided" }, { status: 400 })
     }
 
-    // Check document size limits
     if (fileSize && fileSize > MAX_FILE_SIZE) {
-      console.log(`[v0] File too large: ${fileSize} bytes`)
       return NextResponse.json({
         error: "This document is too large for a free analysis. Upload a shorter document or upgrade to Howard Pro for full analysis of large documents."
       }, { status: 413 })
@@ -251,9 +262,7 @@ export async function POST(request: NextRequest) {
 
     if (rawText) {
       const wordCount = countWords(rawText)
-      console.log(`[v0] Word count: ${wordCount}`)
       if (wordCount > MAX_WORDS) {
-        console.log(`[v0] Document too long: ${wordCount} words`)
         return NextResponse.json({
           error: "This document is too large for a free analysis. Upload a shorter document or upgrade to Howard Pro for full analysis of large documents."
         }, { status: 413 })
@@ -261,44 +270,97 @@ export async function POST(request: NextRequest) {
     }
 
     const extractedTitle = extractDocumentTitle(rawText || "")
-    console.log(`[v0] Extracted title: ${extractedTitle}`)
 
-    let result
-    
-    // For PDFs and images, send as base64 inline data
+    // Build content object
+    const content: { text?: string; base64?: string; mimeType?: string } = {}
     if (fileBase64 && fileType) {
-      console.log(`[v0] Processing base64 file, type: ${fileType}`)
-      result = await analyzeWithGemini({
-        base64: fileBase64,
-        mimeType: fileType,
-      })
+      content.base64 = fileBase64
+      content.mimeType = fileType
     } else {
-      // For DOCX/TXT, send as plain text
-      console.log(`[v0] Processing text content, length: ${rawText?.length || 0}`)
-      result = await analyzeWithGemini({ text: rawText })
+      content.text = rawText
     }
 
-    // If response was truncated, mark the last clause
-    if (result.wasTruncated && result.clauses?.length > 0) {
-      console.log("[v0] Response was truncated, marking last clause")
-      result.clauses[result.clauses.length - 1].truncated = true
-    }
+    // Create streaming response
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder()
+        
+        try {
+          // Pass 1: Get clause outline
+          const { outline, documentTitle } = await getClauseOutline(content)
+          const finalTitle = documentTitle || extractedTitle || filename
 
-    console.log(`[v0] Analysis complete, clauses: ${result.clauses?.length || 0}`)
+          // Send initial metadata
+          const metadata = {
+            type: "metadata",
+            documentId,
+            filename,
+            document_title: finalTitle,
+            totalClauses: outline.length,
+            analyzedAt: new Date().toISOString(),
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`))
 
-    return NextResponse.json({
-      documentId,
-      filename,
-      document_title: result.document_title || extractedTitle || filename,
-      clauses: result.clauses,
-      analyzedAt: new Date().toISOString(),
+          // Pass 2: Analyze in batches
+          const batches: ClauseOutline[][] = []
+          for (let i = 0; i < outline.length; i += BATCH_SIZE) {
+            batches.push(outline.slice(i, i + BATCH_SIZE))
+          }
+
+          console.log(`[v0] Processing ${batches.length} batches of up to ${BATCH_SIZE} clauses each`)
+
+          for (let i = 0; i < batches.length; i++) {
+            const batch = batches[i]
+            console.log(`[v0] Processing batch ${i + 1}/${batches.length}`)
+            
+            try {
+              const clauses = await analyzeBatch(content, batch)
+              
+              const batchData = {
+                type: "batch",
+                batchIndex: i,
+                totalBatches: batches.length,
+                clauses,
+              }
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(batchData)}\n\n`))
+            } catch (batchError) {
+              console.error(`[v0] Batch ${i + 1} failed:`, batchError)
+              const errorData = {
+                type: "batch_error",
+                batchIndex: i,
+                error: batchError instanceof Error ? batchError.message : "Batch analysis failed",
+              }
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorData)}\n\n`))
+            }
+          }
+
+          // Send completion signal
+          controller.enqueue(encoder.encode(`data: [DONE]\n\n`))
+          controller.close()
+        } catch (error) {
+          console.error("[v0] Streaming error:", error)
+          const errorData = {
+            type: "error",
+            error: error instanceof Error ? error.message : "Analysis failed",
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorData)}\n\n`))
+          controller.close()
+        }
+      },
+    })
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      },
     })
   } catch (error) {
     console.error("[v0] Analysis error:", error)
     let errorMessage = "Analysis failed"
     let statusCode = 500
     if (error instanceof Error) {
-      console.error(`[v0] Error: ${error.name} - ${error.message}`)
       if (error.message.includes("rate limit") || error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
         errorMessage = "API rate limit reached. Please try again in a few minutes."
         statusCode = 429
