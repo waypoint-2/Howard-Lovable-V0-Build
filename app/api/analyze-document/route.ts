@@ -82,6 +82,47 @@ Each clause object must have:
 
 Be concise. Return ONLY valid JSON. No markdown fences. Return ONLY a valid JSON object starting with {. No markdown, no code fences, no preamble.`
 
+// Repair truncated JSON by closing open brackets, braces, and strings
+function repairTruncatedJson(text: string): string {
+  let result = text.trim()
+  
+  // If we're inside a string, close it
+  let inString = false
+  let escaped = false
+  for (let i = 0; i < result.length; i++) {
+    const char = result[i]
+    if (escaped) { escaped = false; continue }
+    if (char === '\\') { escaped = true; continue }
+    if (char === '"') inString = !inString
+  }
+  if (inString) result += '"'
+  
+  // Count open brackets and braces
+  let openBraces = 0
+  let openBrackets = 0
+  inString = false
+  escaped = false
+  for (let i = 0; i < result.length; i++) {
+    const char = result[i]
+    if (escaped) { escaped = false; continue }
+    if (char === '\\') { escaped = true; continue }
+    if (char === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (char === '{') openBraces++
+    if (char === '}') openBraces--
+    if (char === '[') openBrackets++
+    if (char === ']') openBrackets--
+  }
+  
+  // Close any open structures
+  // First close arrays (usually inside objects)
+  while (openBrackets > 0) { result += ']'; openBrackets-- }
+  // Then close objects
+  while (openBraces > 0) { result += '}'; openBraces-- }
+  
+  return result
+}
+
 function sanitizeJson(text: string): string {
   let inString = false
   let escaped = false
