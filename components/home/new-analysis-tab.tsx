@@ -94,11 +94,7 @@ export function NewAnalysisTab() {
 
       setUploadState("analyzing")
 
-      // Analyze with AI
-      const analysisInterval = setInterval(() => {
-        setProgress((prev) => Math.min(prev + 5, 90))
-      }, 300)
-
+      // Analyze with AI using Server-Sent Events
       const analyzeResponse = await fetch("/api/analyze-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -111,32 +107,83 @@ export function NewAnalysisTab() {
         }),
       })
 
-      clearInterval(analysisInterval)
-      setProgress(100)
-
       if (!analyzeResponse.ok) {
         const errorData = await analyzeResponse.json()
         throw new Error(errorData.error || "Analysis failed")
       }
 
-      const result = await analyzeResponse.json()
+      // Initialize storage for streaming results
+      let allClauses: any[] = []
+      let documentTitle = ""
+      let totalClauses = 0
 
-      // Store analysis result in sessionStorage for the review page
-      sessionStorage.setItem(
-        "analyzedDocument",
-        JSON.stringify({
-          document_title: result.document_title,
-          clauses: result.clauses,
-          filename: result.filename,
-          documentId: result.documentId,
-          analyzedAt: result.analyzedAt,
-        }),
-      )
+      // Read SSE stream
+      const reader = analyzeResponse.body?.getReader()
+      if (!reader) throw new Error("No response body")
 
-      setUploadState("complete")
+      const decoder = new TextDecoder()
+      let buffer = ""
 
-      // Redirect to the document review page
-      router.push("/review")
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || "" // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6).trim()
+            
+            if (data === "[DONE]") {
+              // Store final result and redirect
+              sessionStorage.setItem(
+                "analyzedDocument",
+                JSON.stringify({
+                  document_title: documentTitle,
+                  clauses: allClauses,
+                  filename: uploadedFile.name,
+                  documentId,
+                  analyzedAt: new Date().toISOString(),
+                }),
+              )
+              setProgress(100)
+              setUploadState("complete")
+              router.push("/review")
+              return
+            }
+
+            try {
+              const parsed = JSON.parse(data)
+              
+              // Handle outline event (pass 1)
+              if (parsed.type === "outline") {
+                totalClauses = parsed.totalClauses || 0
+                documentTitle = parsed.document_title || ""
+                console.log(`[v0] Received outline: ${totalClauses} clauses`)
+              }
+              
+              // Handle batch event (pass 2)
+              if (parsed.type === "batch" && parsed.clauses) {
+                allClauses = [...allClauses, ...parsed.clauses]
+                const progressPercent = totalClauses > 0 
+                  ? Math.min(50 + Math.floor((allClauses.length / totalClauses) * 50), 99)
+                  : 50 + allClauses.length * 5
+                setProgress(progressPercent)
+                console.log(`[v0] Received batch: ${parsed.clauses.length} clauses, total: ${allClauses.length}`)
+              }
+              
+              // Handle error event
+              if (parsed.type === "error") {
+                throw new Error(parsed.message || "Analysis failed")
+              }
+            } catch (parseError) {
+              console.error("[v0] Failed to parse SSE data:", data)
+            }
+          }
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong")
       setUploadState("error")
