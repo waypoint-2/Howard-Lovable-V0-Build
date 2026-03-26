@@ -87,7 +87,7 @@ async function analyzeDocument(
   console.log(`[v0] analyzeDocument: Calling Groq API...`)
 
   const requestBody = {
-    model: "llama-3.3-70b-versatile",
+    model: "openai/gpt-oss-20b",
     messages: [
       {
         role: "system",
