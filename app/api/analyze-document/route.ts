@@ -136,7 +136,7 @@ async function analyzeWithGemini(
     contents: [{ role: "user", parts }],
     config: {
       responseMimeType: "application/json",
-      maxOutputTokens: 16000,
+      maxOutputTokens: 32000,
     },
   })
 
@@ -160,13 +160,16 @@ async function analyzeWithGemini(
     if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
     jsonText = sanitizeJson(jsonText.trim())
     
-    // If truncated, try to repair the JSON by closing open structures
-    if (wasTruncated) {
-      console.log(`[v0] Response was truncated, attempting JSON repair...`)
-      jsonText = repairTruncatedJson(jsonText)
-    }
+    const rawParsed = JSON.parse(jsonText)
     
-    parsed = JSON.parse(jsonText)
+    // Handle both formats: plain array or wrapped object with clauses property
+    if (Array.isArray(rawParsed)) {
+      parsed = { clauses: rawParsed }
+    } else if (rawParsed.clauses && Array.isArray(rawParsed.clauses)) {
+      parsed = rawParsed
+    } else {
+      throw new Error("Response is neither an array nor has a clauses property")
+    }
   } catch (e) {
     console.error(`[v0] Failed to parse Gemini response:`, responseText.substring(0, 500))
     throw new Error("Failed to parse AI response")
