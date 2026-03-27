@@ -2,7 +2,25 @@ import { NextResponse, type NextRequest } from "next/server"
 import { Ratelimit } from "@upstash/ratelimit"
 import { Redis } from "@upstash/redis"
 import { GoogleGenAI } from "@google/genai"
-import pLimit from "p-limit"
+
+// Inline concurrency limiter (replaces p-limit ESM package)
+function createLimiter(concurrency: number) {
+  let active = 0
+  const queue: (() => void)[] = []
+  return function limit<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const run = async () => {
+        active++
+        try { resolve(await fn()) } catch(e) { reject(e) } finally {
+          active--
+          if (queue.length > 0) queue.shift()!()
+        }
+      }
+      if (active < concurrency) run()
+      else queue.push(run)
+    })
+  }
+}
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -330,7 +348,7 @@ export async function POST(request: NextRequest) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`))
 
           // Pass 2: Analyze clauses in parallel with concurrency limit of 10
-          const limit = pLimit(10)
+          const limit = createLimiter(10)
           console.log(`[v0] Starting parallel analysis of ${outline.length} clauses with concurrency 10`)
 
           const tasks = outline.map((clause, index) =>
