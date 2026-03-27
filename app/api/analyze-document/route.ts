@@ -3,6 +3,9 @@ import { Ratelimit } from "@upstash/ratelimit"
 import { Redis } from "@upstash/redis"
 import Anthropic from "@anthropic-ai/sdk"
 
+export const maxDuration = 60
+export const dynamic = "force-dynamic"
+
 // Inline concurrency limiter (replaces p-limit ESM package)
 function createLimiter(concurrency: number) {
   let active = 0
