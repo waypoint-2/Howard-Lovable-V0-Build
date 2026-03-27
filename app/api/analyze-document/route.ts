@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { Ratelimit } from "@upstash/ratelimit"
 import { Redis } from "@upstash/redis"
-import { GoogleGenAI } from "@google/genai"
+import Anthropic from "@anthropic-ai/sdk"
 
 // Inline concurrency limiter (replaces p-limit ESM package)
 function createLimiter(concurrency: number) {
@@ -32,11 +32,11 @@ const ratelimit = new Ratelimit({
   limiter: Ratelimit.slidingWindow(10, "1 h"),
 })
 
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! })
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
 
 const MAX_WORDS = 5000
 const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
-const BATCH_SIZE = 4
+const CONCURRENCY = 3
 
 function extractDocumentTitle(rawText: string): string {
   if (!rawText) return ""
@@ -154,70 +154,78 @@ function parseJsonResponse(responseText: string): unknown {
   return JSON.parse(jsonText)
 }
 
-function buildDocumentParts(
+function buildDocumentContentBlocks(
   content: { text?: string; base64?: string; mimeType?: string }
-): Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> {
-  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = []
-  
+): Anthropic.MessageParam["content"] {
   if (content.base64 && content.mimeType) {
-    parts.push({
-      inlineData: {
-        mimeType: content.mimeType,
-        data: content.base64,
-      },
-    })
-  } else if (content.text) {
-    parts.push({ text: content.text })
+    if (content.mimeType === "application/pdf") {
+      return [
+        {
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: content.base64,
+          },
+        } as Anthropic.DocumentBlockParam,
+        { type: "text", text: `${systemPrompt}\n\n${outlinePrompt}` },
+      ]
+    }
+    // Image types
+    if (content.mimeType.startsWith("image/")) {
+      return [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: content.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+            data: content.base64,
+          },
+        } as Anthropic.ImageBlockParam,
+        { type: "text", text: `${systemPrompt}\n\n${outlinePrompt}` },
+      ]
+    }
   }
-  
-  return parts
+  // Plain text fallback
+  return `${systemPrompt}\n\n${outlinePrompt}\n\n--- DOCUMENT START ---\n${content.text}\n--- DOCUMENT END ---`
 }
 
 // Pass 1: Get clause outline
 async function getClauseOutline(
   content: { text?: string; base64?: string; mimeType?: string }
 ): Promise<{ outline: ClauseOutline[]; documentTitle: string }> {
-  console.log(`[v0] Pass 1: Getting clause outline...`)
+  console.log(`[v0] Pass 1: Getting clause outline via Claude Sonnet...`)
 
-  const documentParts = buildDocumentParts(content)
-  const parts = [
-    { text: `${systemPrompt}\n\n${outlinePrompt}\n\n--- DOCUMENT START ---` },
-    ...documentParts,
-    { text: "--- DOCUMENT END ---" },
-  ]
+  const messageContent = buildDocumentContentBlocks(content)
 
-  const response = await genAI.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: [{ role: "user", parts }],
-    config: {
-      responseMimeType: "application/json",
-      maxOutputTokens: 4000,
-    },
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 4000,
+    messages: [{ role: "user", content: messageContent }],
   })
 
-  const responseText = response.text
+  const textBlock = response.content.find((b): b is Anthropic.TextBlock => b.type === "text")
+  const responseText = textBlock?.text ?? ""
   if (!responseText) throw new Error("No content in outline response")
 
   console.log(`[v0] Pass 1: Response length: ${responseText.length} chars`)
 
   const parsed = parseJsonResponse(responseText)
-  
+
   let outline: ClauseOutline[]
   if (Array.isArray(parsed)) {
     outline = parsed as ClauseOutline[]
-  } else if (typeof parsed === 'object' && parsed !== null && 'clauses' in parsed) {
+  } else if (typeof parsed === "object" && parsed !== null && "clauses" in parsed) {
     outline = (parsed as { clauses: ClauseOutline[] }).clauses
   } else {
     throw new Error("Invalid outline format")
   }
 
-  // Extract document title from first line if present
   let documentTitle = ""
-  if (typeof parsed === 'object' && parsed !== null && 'document_title' in parsed) {
+  if (typeof parsed === "object" && parsed !== null && "document_title" in parsed) {
     documentTitle = (parsed as { document_title: string }).document_title
   }
 
-  // Validate minimum clause count
   if (outline.length < 3) {
     throw new Error("Document parsing returned too few clauses — possible parsing failure")
   }
@@ -249,16 +257,14 @@ ${batchAnalysisPrompt}
 
 Return ONLY the JSON object directly. No markdown fences.`
 
-  const response = await genAI.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    config: {
-      responseMimeType: "application/json",
-      maxOutputTokens: 2000,
-    },
+  const response = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 2000,
+    messages: [{ role: "user", content: prompt }],
   })
 
-  const responseText = response.text
+  const textBlock = response.content.find((b): b is Anthropic.TextBlock => b.type === "text")
+  const responseText = textBlock?.text ?? ""
   if (!responseText) throw new Error(`No content for ${clauseId}`)
 
   const parsed = parseJsonResponse(responseText) as Clause
@@ -274,34 +280,33 @@ async function analyzeClauseWithRetry(
   clauseText: string,
   clauseIndex: number,
   totalClauses: number,
-  maxRetries: number = 2
+  maxRetries: number = 3
 ): Promise<Clause> {
   const TIMEOUT_MS = 25000
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       console.log(`[v0] Attempt ${attempt}/${maxRetries} for clause ${clauseId}`)
-      
+
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Clause analysis timeout")), TIMEOUT_MS)
       )
-      
+
       const result = await Promise.race([
         analyzeClause(clauseId, clauseTitle, clauseText, clauseIndex, totalClauses),
         timeoutPromise,
       ])
-      
+
       return result
     } catch (error) {
       if (attempt === maxRetries) throw error
       const errorMsg = error instanceof Error ? error.message : String(error)
       console.warn(`[v0] Clause ${clauseId} attempt ${attempt} failed, retrying...`, errorMsg)
-      // Wait longer on rate limit errors
-      const delay = errorMsg.includes("429") || errorMsg.includes("quota") ? 10000 : 2000
-      await new Promise(resolve => setTimeout(resolve, delay))
+      // Exponential backoff: 2s, 4s
+      await new Promise(resolve => setTimeout(resolve, 2000 * attempt))
     }
   }
-  
+
   throw new Error(`Failed to analyze clause ${clauseId} after ${maxRetries} attempts`)
 }
 
@@ -340,7 +345,6 @@ export async function POST(request: NextRequest) {
 
     const extractedTitle = extractDocumentTitle(rawText || "")
 
-    // Build content object
     const content: { text?: string; base64?: string; mimeType?: string } = {}
     if (fileBase64 && fileType) {
       content.base64 = fileBase64
@@ -353,9 +357,9 @@ export async function POST(request: NextRequest) {
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder()
-        
+
         try {
-          // Pass 1: Get clause outline
+          // Pass 1: Get clause outline (Claude Sonnet)
           const { outline, documentTitle } = await getClauseOutline(content)
           const finalTitle = documentTitle || extractedTitle || filename
 
@@ -370,17 +374,12 @@ export async function POST(request: NextRequest) {
           }
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`))
 
-          // Pass 2: Analyze clauses sequentially with delay to respect rate limits
-          // Gemini free tier: ~20 requests/minute, so we use 2 concurrent + 3s delay
-          const limit = createLimiter(2)
-          console.log(`[v0] Starting analysis of ${outline.length} clauses with concurrency 2 + rate limit delay`)
+          // Pass 2: Analyze clauses in parallel (Claude Haiku, concurrency 3)
+          const limit = createLimiter(CONCURRENCY)
+          console.log(`[v0] Starting analysis of ${outline.length} clauses with concurrency ${CONCURRENCY}`)
 
           const tasks = outline.map((clause, index) =>
             limit(async () => {
-              // Add 3-second delay between clause starts to stay under rate limit
-              if (index > 0) {
-                await new Promise(resolve => setTimeout(resolve, 3000))
-              }
               try {
                 const result = await analyzeClauseWithRetry(
                   clause.id,
@@ -404,7 +403,6 @@ export async function POST(request: NextRequest) {
           await Promise.all(tasks)
           console.log(`[v0] All clauses analyzed`)
 
-          // Send completion signal
           controller.enqueue(encoder.encode(`data: [DONE]\n\n`))
           controller.close()
         } catch (error) {
@@ -431,10 +429,10 @@ export async function POST(request: NextRequest) {
     let errorMessage = "Analysis failed"
     let statusCode = 500
     if (error instanceof Error) {
-      if (error.message.includes("rate limit") || error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
+      if (error.message.includes("rate limit") || error.message.includes("429") || error.message.includes("overloaded")) {
         errorMessage = "API rate limit reached. Please try again in a few minutes."
         statusCode = 429
-      } else if (error.message.includes("API key")) {
+      } else if (error.message.includes("API key") || error.message.includes("authentication")) {
         errorMessage = "AI service configuration error. Please contact support."
         statusCode = 500
       } else {
