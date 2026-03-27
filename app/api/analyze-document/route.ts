@@ -84,9 +84,18 @@ interface Clause {
 
 const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk. Return valid JSON only. No preamble, no markdown fences, just the JSON.`
 
-const outlinePrompt = `Identify all clauses/sections in this legal document. Return a JSON array of objects, each with:
-- id: "clause-N" (sequential numbering)
-- title: the exact section heading from the document
+const outlinePrompt = `You are analyzing a legal document. Your job is to identify EVERY clause, section, and article in this document — do not skip any.
+
+Return a JSON array where each element has:
+- id: "clause-N" (sequential, starting at clause-1)
+- title: the exact heading or section title from the document
+
+Rules:
+- Include ALL numbered sections, articles, and clauses — even short ones
+- Include subsections if they have distinct headings
+- If a section has no heading, use its first 5 words as the title
+- Aim to find at least 8–20 clauses for a typical legal document
+- Do NOT merge sections together
 
 Return ONLY a valid JSON array starting with [. No markdown, no code fences, no preamble.`
 
@@ -204,6 +213,11 @@ async function getClauseOutline(
   let documentTitle = ""
   if (typeof parsed === 'object' && parsed !== null && 'document_title' in parsed) {
     documentTitle = (parsed as { document_title: string }).document_title
+  }
+
+  // Validate minimum clause count
+  if (outline.length < 3) {
+    throw new Error("Document parsing returned too few clauses — possible parsing failure")
   }
 
   console.log(`[v0] Pass 1: Found ${outline.length} clauses`)
