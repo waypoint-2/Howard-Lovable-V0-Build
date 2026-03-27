@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server"
 import { Ratelimit } from "@upstash/ratelimit"
 import { Redis } from "@upstash/redis"
 import { GoogleGenAI } from "@google/genai"
+import pLimit from "p-limit"
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -71,13 +72,12 @@ const outlinePrompt = `Identify all clauses/sections in this legal document. Ret
 
 Return ONLY a valid JSON array starting with [. No markdown, no code fences, no preamble.`
 
-const batchAnalysisPrompt = `Analyze ONLY the following clauses from this legal document. Return a JSON object with:
-{
-  "clauses": [array of clause objects for the specified clauses ONLY]
-}
+const batchAnalysisPrompt = `Analyze the following clause from this legal document. Return a JSON object with the clause analysis (not wrapped in {"clauses": [...]} — just the object directly).
+
+Clause to analyze:
 
 Each clause object must have:
-- id: use the id provided below
+- id: use the id provided
 - clauseNumber: "§ N"
 - title: original legal heading
 - humanTitle: max 4 words plain English
@@ -91,7 +91,7 @@ Each clause object must have:
 - definitions: optional, MAX 2 terms, each with { term, plainMeaning (1 sentence), example, importance }
 - questions: optional, MAX 1 question with { question, answer, clauseReference }
 
-ANALYZE ONLY THESE CLAUSES:`
+ANALYZE ONLY THIS CLAUSE. Return the clause object directly, not wrapped.`
 
 function sanitizeJson(text: string): string {
   let inString = false
@@ -192,19 +192,21 @@ async function getClauseOutline(
   return { outline, documentTitle }
 }
 
-// Pass 2: Analyze a batch of clauses
-async function analyzeBatch(
+// Pass 2: Analyze a single clause
+async function analyzeClause(
   content: { text?: string; base64?: string; mimeType?: string },
-  batch: ClauseOutline[]
-): Promise<Clause[]> {
-  const clauseList = batch.map(c => `- ${c.id}: "${c.title}"`).join("\n")
-  console.log(`[v0] Pass 2: Analyzing batch of ${batch.length} clauses`)
+  clause: ClauseOutline,
+  outline: ClauseOutline[],
+  clauseIndex: number
+): Promise<Clause> {
+  const clauseNumber = clauseIndex + 1
+  console.log(`[v0] Pass 2: Analyzing clause ${clauseNumber}/${outline.length}: ${clause.title}`)
 
   const documentParts = buildDocumentParts(content)
   const parts = [
-    { text: `${systemPrompt}\n\n${batchAnalysisPrompt}\n${clauseList}\n\nBe concise. Return ONLY valid JSON. No markdown fences.\n\n--- DOCUMENT START ---` },
+    { text: `${systemPrompt}\n\n${batchAnalysisPrompt}\n\nClause ID: ${clause.id}\nClause Title: ${clause.title}\n\n--- DOCUMENT START ---` },
     ...documentParts,
-    { text: "--- DOCUMENT END ---" },
+    { text: "--- DOCUMENT END ---\n\nBe concise. Return ONLY valid JSON object. No markdown fences." },
   ]
 
   const response = await genAI.models.generateContent({
@@ -212,28 +214,54 @@ async function analyzeBatch(
     contents: [{ role: "user", parts }],
     config: {
       responseMimeType: "application/json",
-      maxOutputTokens: 16000,
+      maxOutputTokens: 2000,
     },
   })
 
   const responseText = response.text
-  if (!responseText) throw new Error("No content in batch response")
+  if (!responseText) throw new Error(`No content in clause response for ${clause.id}`)
 
-  console.log(`[v0] Pass 2: Batch response length: ${responseText.length} chars`)
+  console.log(`[v0] Pass 2: Clause ${clauseNumber} response length: ${responseText.length} chars`)
 
-  const parsed = parseJsonResponse(responseText)
+  const parsed = parseJsonResponse(responseText) as Clause
+  if (!parsed.id) parsed.id = clause.id
+  if (!parsed.clauseNumber) parsed.clauseNumber = `§ ${clauseNumber}`
   
-  let clauses: Clause[]
-  if (Array.isArray(parsed)) {
-    clauses = parsed as Clause[]
-  } else if (typeof parsed === 'object' && parsed !== null && 'clauses' in parsed) {
-    clauses = (parsed as { clauses: Clause[] }).clauses
-  } else {
-    throw new Error("Invalid batch response format")
-  }
+  return parsed
+}
 
-  console.log(`[v0] Pass 2: Batch returned ${clauses.length} clauses`)
-  return clauses
+// Retry wrapper with timeout
+async function analyzeClauseWithRetry(
+  content: { text?: string; base64?: string; mimeType?: string },
+  clause: ClauseOutline,
+  outline: ClauseOutline[],
+  clauseIndex: number,
+  maxRetries: number = 2
+): Promise<Clause> {
+  const TIMEOUT_MS = 10000
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[v0] Attempt ${attempt}/${maxRetries} for clause ${clause.id}`)
+      
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Clause analysis timeout")), TIMEOUT_MS)
+      )
+      
+      const result = await Promise.race([
+        analyzeClause(content, clause, outline, clauseIndex),
+        timeoutPromise,
+      ])
+      
+      return result
+    } catch (error) {
+      if (attempt === maxRetries) throw error
+      console.warn(`[v0] Clause ${clause.id} attempt ${attempt} failed, retrying...`, error instanceof Error ? error.message : error)
+      await new Promise(resolve => setTimeout(resolve, 1000)) // Wait before retry
+    }
+  }
+  
+  throw new Error(`Failed to analyze clause ${clause.id} after ${maxRetries} attempts`)
 }
 
 export async function POST(request: NextRequest) {
@@ -301,38 +329,32 @@ export async function POST(request: NextRequest) {
           }
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`))
 
-          // Pass 2: Analyze in batches
-          const batches: ClauseOutline[][] = []
-          for (let i = 0; i < outline.length; i += BATCH_SIZE) {
-            batches.push(outline.slice(i, i + BATCH_SIZE))
-          }
+          // Pass 2: Analyze clauses in parallel with concurrency limit of 10
+          const limit = pLimit(10)
+          console.log(`[v0] Starting parallel analysis of ${outline.length} clauses with concurrency 10`)
 
-          console.log(`[v0] Processing ${batches.length} batches of up to ${BATCH_SIZE} clauses each`)
+          const tasks = outline.map((clause, index) =>
+            limit(async () => {
+              try {
+                const result = await analyzeClauseWithRetry(content, clause, outline, index)
+                try {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause", clause: result })}\n\n`))
+                } catch (streamError) {
+                  console.error(`[v0] Stream error sending clause ${clause.id}:`, streamError)
+                }
+              } catch (err) {
+                console.error(`[v0] Clause ${clause.id} analysis failed:`, err)
+                try {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause_error", clauseId: clause.id })}\n\n`))
+                } catch (streamError) {
+                  console.error(`[v0] Stream error sending clause error for ${clause.id}:`, streamError)
+                }
+              }
+            })
+          )
 
-          for (let i = 0; i < batches.length; i++) {
-            const batch = batches[i]
-            console.log(`[v0] Processing batch ${i + 1}/${batches.length}`)
-            
-            try {
-              const clauses = await analyzeBatch(content, batch)
-              
-              const batchData = {
-                type: "batch",
-                batchIndex: i,
-                totalBatches: batches.length,
-                clauses,
-              }
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(batchData)}\n\n`))
-            } catch (batchError) {
-              console.error(`[v0] Batch ${i + 1} failed:`, batchError)
-              const errorData = {
-                type: "batch_error",
-                batchIndex: i,
-                error: batchError instanceof Error ? batchError.message : "Batch analysis failed",
-              }
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorData)}\n\n`))
-            }
-          }
+          await Promise.all(tasks)
+          console.log(`[v0] All clauses analyzed`)
 
           // Send completion signal
           controller.enqueue(encoder.encode(`data: [DONE]\n\n`))

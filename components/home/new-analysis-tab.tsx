@@ -157,14 +157,24 @@ export function NewAnalysisTab() {
             try {
               const parsed = JSON.parse(data)
               
-              // Handle outline event (pass 1)
-              if (parsed.type === "outline") {
+              // Handle metadata event (pass 1 complete)
+              if (parsed.type === "metadata") {
                 totalClauses = parsed.totalClauses || 0
                 documentTitle = parsed.document_title || ""
-                console.log(`[v0] Received outline: ${totalClauses} clauses`)
+                console.log(`[v0] Received metadata: ${totalClauses} clauses`)
               }
               
-              // Handle batch event (pass 2)
+              // Handle individual clause event (pass 2 - new parallel format)
+              if (parsed.type === "clause" && parsed.clause) {
+                allClauses.push(parsed.clause)
+                const progressPercent = totalClauses > 0 
+                  ? Math.min(50 + Math.floor((allClauses.length / totalClauses) * 50), 99)
+                  : 50 + allClauses.length * 5
+                setProgress(progressPercent)
+                console.log(`[v0] Received clause: ${parsed.clause.id}, total: ${allClauses.length}`)
+              }
+              
+              // Handle batch event (fallback for older format)
               if (parsed.type === "batch" && parsed.clauses) {
                 allClauses = [...allClauses, ...parsed.clauses]
                 const progressPercent = totalClauses > 0 
