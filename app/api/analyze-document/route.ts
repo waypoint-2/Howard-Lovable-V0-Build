@@ -294,8 +294,11 @@ async function analyzeClauseWithRetry(
       return result
     } catch (error) {
       if (attempt === maxRetries) throw error
-      console.warn(`[v0] Clause ${clauseId} attempt ${attempt} failed, retrying...`, error instanceof Error ? error.message : error)
-      await new Promise(resolve => setTimeout(resolve, 1000)) // Wait before retry
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      console.warn(`[v0] Clause ${clauseId} attempt ${attempt} failed, retrying...`, errorMsg)
+      // Wait longer on rate limit errors
+      const delay = errorMsg.includes("429") || errorMsg.includes("quota") ? 10000 : 2000
+      await new Promise(resolve => setTimeout(resolve, delay))
     }
   }
   
@@ -367,12 +370,17 @@ export async function POST(request: NextRequest) {
           }
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`))
 
-          // Pass 2: Analyze clauses in parallel with concurrency limit of 10
-          const limit = createLimiter(10)
-          console.log(`[v0] Starting parallel analysis of ${outline.length} clauses with concurrency 10`)
+          // Pass 2: Analyze clauses sequentially with delay to respect rate limits
+          // Gemini free tier: ~20 requests/minute, so we use 2 concurrent + 3s delay
+          const limit = createLimiter(2)
+          console.log(`[v0] Starting analysis of ${outline.length} clauses with concurrency 2 + rate limit delay`)
 
           const tasks = outline.map((clause, index) =>
             limit(async () => {
+              // Add 3-second delay between clause starts to stay under rate limit
+              if (index > 0) {
+                await new Promise(resolve => setTimeout(resolve, 3000))
+              }
               try {
                 const result = await analyzeClauseWithRetry(
                   clause.id,
