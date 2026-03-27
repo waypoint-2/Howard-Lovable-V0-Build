@@ -1,56 +1,20 @@
 "use client"
 
 import Link from "next/link"
-import { FileText, Clock, ArrowUpRight, Shield, AlertTriangle, CheckCircle } from "lucide-react"
+import { FileText, Clock, ArrowUpRight, Shield, AlertTriangle, CheckCircle, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { useState } from "react"
 
-const recentDocs = [
-  {
-    id: 1,
-    title: "Software License Agreement",
-    type: "License",
-    updatedAt: "2 hours ago",
-    clauses: 24,
-    riskLevel: "high",
-    progress: 75,
-  },
-  {
-    id: 2,
-    title: "Employment Contract - Senior Developer",
-    type: "Employment",
-    updatedAt: "Yesterday",
-    clauses: 18,
-    riskLevel: "medium",
-    progress: 100,
-  },
-  {
-    id: 3,
-    title: "Office Lease Agreement Q1 2025",
-    type: "Real Estate",
-    updatedAt: "3 days ago",
-    clauses: 32,
-    riskLevel: "low",
-    progress: 100,
-  },
-  {
-    id: 4,
-    title: "Vendor Service Agreement - Acme Corp",
-    type: "Vendor",
-    updatedAt: "1 week ago",
-    clauses: 15,
-    riskLevel: "medium",
-    progress: 45,
-  },
-  {
-    id: 5,
-    title: "Non-Disclosure Agreement - Project X",
-    type: "NDA",
-    updatedAt: "2 weeks ago",
-    clauses: 8,
-    riskLevel: "low",
-    progress: 100,
-  },
-]
+interface Document {
+  id: string
+  filename: string
+  created_at: string
+  analysis?: {
+    overall_risk: "low" | "medium" | "high"
+    status: string
+    clauses: Array<{ id: string }>
+  }
+}
 
 const riskConfig = {
   high: { icon: AlertTriangle, color: "text-[var(--risk-high)]", bg: "bg-[var(--risk-high-bg)]", label: "High Risk" },
@@ -59,22 +23,68 @@ const riskConfig = {
 }
 
 export function RecentTab() {
+  const [documents, setDocuments] = useState<Document[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+  
+  // For now, show empty state since we're not using auth
+  // Documents are analyzed on-demand and stored in sessionStorage
+
+  const formatDate = (dateString: string) => {
+    const date = new Date(dateString)
+    const now = new Date()
+    const diffMs = now.getTime() - date.getTime()
+    const diffMins = Math.floor(diffMs / 60000)
+    const diffHours = Math.floor(diffMs / 3600000)
+    const diffDays = Math.floor(diffMs / 86400000)
+
+    if (diffMins < 1) return "Just now"
+    if (diffMins < 60) return `${diffMins} ${diffMins === 1 ? "minute" : "minutes"} ago`
+    if (diffHours < 24) return `${diffHours} ${diffHours === 1 ? "hour" : "hours"} ago`
+    if (diffDays < 7) return `${diffDays} ${diffDays === 1 ? "day" : "days"} ago`
+    return date.toLocaleDateString()
+  }
+
+  if (isLoading) {
+    return (
+      <div className="w-full max-w-2xl mx-auto flex items-center justify-center py-12">
+        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
+
+  if (documents.length === 0) {
+    return (
+      <div className="w-full max-w-2xl mx-auto">
+        <div className="text-center py-12">
+          <FileText className="w-12 h-12 text-muted-foreground/30 mx-auto mb-4" />
+          <h3 className="font-medium text-foreground mb-1">No documents yet</h3>
+          <p className="text-sm text-muted-foreground">Upload your first document to get started</p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="w-full max-w-2xl mx-auto">
       <div className="space-y-3">
-        {recentDocs.map((doc, index) => {
-          const risk = riskConfig[doc.riskLevel as keyof typeof riskConfig]
+        {documents.map((doc, index) => {
+          const analysis = doc.analysis?.[0]
+          const riskLevel = analysis?.overall_risk || "low"
+          const risk = riskConfig[riskLevel as keyof typeof riskConfig]
           const RiskIcon = risk.icon
+          const clauseCount = analysis?.clauses?.length || 0
+          const isAnalyzing = analysis?.status === "processing"
 
           return (
             <Link
               key={doc.id}
-              href="/"
+              href={analysis ? `/review/${doc.id}` : "#"}
               className={cn(
                 "group flex items-center gap-4 p-4 rounded-xl",
                 "bg-card border border-border/40 hover:border-border/80",
                 "hover:shadow-md transition-all duration-200",
                 "animate-fade-in-up",
+                !analysis && "opacity-50 pointer-events-none"
               )}
               style={{ animationDelay: `${index * 50}ms` }}
             >
@@ -87,45 +97,51 @@ export function RecentTab() {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-1">
                   <h3 className="font-medium text-foreground truncate group-hover:text-[var(--brand)] transition-colors">
-                    {doc.title}
+                    {doc.filename}
                   </h3>
-                  <ArrowUpRight className="w-4 h-4 text-muted-foreground/0 group-hover:text-muted-foreground transition-all shrink-0" />
+                  {analysis && <ArrowUpRight className="w-4 h-4 text-muted-foreground/0 group-hover:text-muted-foreground transition-all shrink-0" />}
                 </div>
                 <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                  <span className="px-2 py-0.5 rounded-full bg-accent/60">{doc.type}</span>
                   <span className="flex items-center gap-1">
                     <Clock className="w-3 h-3" />
-                    {doc.updatedAt}
+                    {formatDate(doc.created_at)}
                   </span>
-                  <span>{doc.clauses} clauses</span>
+                  {analysis && <span>{clauseCount} clauses</span>}
+                  {isAnalyzing && <span className="text-[var(--brand)]">Analyzing...</span>}
                 </div>
               </div>
 
               {/* Risk Badge */}
-              <div
-                className={cn(
-                  "hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium",
-                  risk.bg,
-                  risk.color,
-                )}
-              >
-                <RiskIcon className="w-3.5 h-3.5" />
-                {risk.label}
-              </div>
+              {analysis && (
+                <div
+                  className={cn(
+                    "hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium",
+                    risk.bg,
+                    risk.color,
+                  )}
+                >
+                  <RiskIcon className="w-3.5 h-3.5" />
+                  {risk.label}
+                </div>
+              )}
 
               {/* Progress */}
-              <div className="hidden md:flex flex-col items-end gap-1 shrink-0 w-20">
-                <span className="text-xs text-muted-foreground">{doc.progress}%</span>
-                <div className="w-full h-1.5 bg-accent/60 rounded-full overflow-hidden">
-                  <div
-                    className={cn(
-                      "h-full rounded-full transition-all",
-                      doc.progress === 100 ? "bg-[var(--success)]" : "bg-[var(--brand)]",
-                    )}
-                    style={{ width: `${doc.progress}%` }}
-                  />
+              {analysis && (
+                <div className="hidden md:flex flex-col items-end gap-1 shrink-0 w-20">
+                  <span className="text-xs text-muted-foreground">
+                    {analysis.status === "completed" ? "100%" : "Analyzing..."}
+                  </span>
+                  <div className="w-full h-1.5 bg-accent/60 rounded-full overflow-hidden">
+                    <div
+                      className={cn(
+                        "h-full rounded-full transition-all",
+                        analysis.status === "completed" ? "bg-[var(--success)]" : "bg-[var(--brand)]",
+                      )}
+                      style={{ width: analysis.status === "completed" ? "100%" : "60%" }}
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
             </Link>
           )
         })}

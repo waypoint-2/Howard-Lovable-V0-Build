@@ -63,7 +63,7 @@ export function ProductHome() {
             ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}
           `}
         >
-          <Tabs defaultValue="recent" className="w-full">
+          <Tabs defaultValue="new" className="w-full">
             <div className="flex justify-center mb-8">
               <TabsList className="inline-flex h-12 items-center justify-center rounded-full bg-muted/50 p-1.5 text-muted-foreground border border-border/40">
                 <TabsTrigger

@@ -62,7 +62,7 @@ export function AppNav({ onMenuToggle, documentTitle = "Software License Agreeme
 
           <div
             className={cn(
-              "absolute top-full left-0 mt-1 w-56 bg-card border border-border/60 rounded-xl shadow-lg p-1.5 z-50",
+              "absolute top-full left-0 mt-1 w-56 bg-card border border-border/60 rounded-xl shadow-lg p-1.5 z-[100]",
               "transition-all duration-200 ease-out origin-top",
               fileMenuOpen
                 ? "opacity-100 scale-100 translate-y-0"

@@ -1,268 +1,446 @@
-import { NextResponse } from "next/server"
+import { NextResponse, type NextRequest } from "next/server"
+import { Ratelimit } from "@upstash/ratelimit"
+import { Redis } from "@upstash/redis"
+import { GoogleGenAI } from "@google/genai"
 
-function parseDocumentIntoSections(text: string, filename: string) {
-  const lines = text.split("\n").filter((line) => line.trim())
-  const clauses: any[] = []
+// Inline concurrency limiter (replaces p-limit ESM package)
+function createLimiter(concurrency: number) {
+  let active = 0
+  const queue: (() => void)[] = []
+  return function limit<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const run = async () => {
+        active++
+        try { resolve(await fn()) } catch(e) { reject(e) } finally {
+          active--
+          if (queue.length > 0) queue.shift()!()
+        }
+      }
+      if (active < concurrency) run()
+      else queue.push(run)
+    })
+  }
+}
 
-  // Common section patterns
-  const sectionPatterns = [
-    /^(\d+)\.\s+(.+)$/, // "1. Section Title"
-    /^Section\s+(\d+)[:.]?\s*(.*)$/i, // "Section 1: Title"
-    /^Article\s+(\d+)[:.]?\s*(.*)$/i, // "Article 1: Title"
-    /^§\s*(\d+)[:.]?\s*(.*)$/, // "§ 1: Title"
-    /^([IVXLCDM]+)\.\s+(.+)$/, // "I. Section Title"
-    /^([A-Z])\.\s+(.+)$/, // "A. Section Title"
-    /^ARTICLE\s+([IVXLCDM]+)[:.]?\s*(.*)$/i, // "ARTICLE I: Title"
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+})
+
+const ratelimit = new Ratelimit({
+  redis: redis,
+  limiter: Ratelimit.slidingWindow(10, "1 h"),
+})
+
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! })
+
+const MAX_WORDS = 5000
+const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
+const BATCH_SIZE = 4
+
+function extractDocumentTitle(rawText: string): string {
+  if (!rawText) return ""
+  const lines = rawText.split("\n").map((l) => l.trim()).filter((l) => l.length > 0)
+  for (const line of lines.slice(0, 10)) {
+    if (line.length < 5 || line.length > 150) continue
+    if (line === line.toUpperCase() && line.length > 5) return line
+    if (
+      (line.includes("Agreement") || line.includes("Contract") ||
+        line.includes("License") || line.includes("Policy") ||
+        line.includes("Terms") || line.includes("Confidentiality") ||
+        line.includes("Disclosure") || line.includes("Service")) &&
+      line.length > 10
+    ) return line
+  }
+  return lines[0] || ""
+}
+
+function countWords(text: string): number {
+  return text.trim().split(/\s+/).filter(w => w.length > 0).length
+}
+
+interface ClauseOutline {
+  id: string
+  title: string
+  text?: string
+}
+
+interface Clause {
+  id: string
+  clauseNumber: string
+  title: string
+  humanTitle: string
+  subtitle: string
+  originalText: string
+  plainMeaning: string
+  whyMatters: string[]
+  riskLevel: "low" | "medium" | "high"
+  favors: string
+  commonness: "Standard" | "Aggressive" | "Favorable"
+  notableCharacteristics?: string[]
+  definitions?: Array<{ term: string; plainMeaning: string; example: string; importance: string }>
+  questions?: Array<{ question: string; answer: string; clauseReference: string }>
+  truncated?: boolean
+}
+
+const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk. Return valid JSON only. No preamble, no markdown fences, just the JSON.`
+
+const outlinePrompt = `You are analyzing a legal document. Identify EVERY clause, section, and article — do not skip any.
+
+Return a JSON array where each element has:
+- id: "clause-N" (sequential, starting at clause-1)
+- title: the exact heading or section title from the document
+- text: the full text content of that clause/section (everything under that heading until the next heading)
+
+Rules:
+- Include ALL numbered sections, articles, and clauses — even short ones
+- Include subsections if they have distinct headings
+- Capture the complete text of each clause in the "text" field
+- Aim to find at least 8–20 clauses for a typical legal document
+- Do NOT merge sections together
+
+Return ONLY a valid JSON array starting with [. No markdown, no code fences, no preamble.`
+
+const batchAnalysisPrompt = `Analyze the following clause from this legal document. Return a JSON object with the clause analysis (not wrapped in {"clauses": [...]} — just the object directly).
+
+Clause to analyze:
+
+Each clause object must have:
+- id: use the id provided
+- clauseNumber: "§ N"
+- title: original legal heading
+- humanTitle: max 4 words plain English
+- subtitle: e.g. "142 words • high risk"
+- originalText: clause content WITHOUT the section heading as first line. Use markdown: **bold** for defined terms, numbered lists, indented (a) (b) (i) (ii) on separate lines
+- plainMeaning: 2 sentences MAX plain English
+- whyMatters: string array, 2 bullets MAX
+- riskLevel: "low" | "medium" | "high"
+- favors: e.g. "Licensor" or "Neutral"
+- commonness: "Standard" | "Aggressive" | "Favorable"
+- definitions: optional, MAX 2 terms, each with { term, plainMeaning (1 sentence), example, importance }
+- questions: optional, MAX 1 question with { question, answer, clauseReference }
+
+ANALYZE ONLY THIS CLAUSE. Return the clause object directly, not wrapped.`
+
+function sanitizeJson(text: string): string {
+  let inString = false
+  let escaped = false
+  let fixed = ""
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+    const code = char.charCodeAt(0)
+    if (escaped) { fixed += char; escaped = false; continue }
+    if (char === "\\") { fixed += char; escaped = true; continue }
+    if (char === '"') { inString = !inString; fixed += char; continue }
+    if (inString && code < 32) {
+      if (code === 10) fixed += "\\n"
+      else if (code === 13) fixed += "\\r"
+      else if (code === 9) fixed += "\\t"
+      else if (code === 8) fixed += "\\b"
+      else if (code === 12) fixed += "\\f"
+    } else {
+      fixed += char
+    }
+  }
+  return fixed
+}
+
+function parseJsonResponse(responseText: string): unknown {
+  let jsonText = responseText.trim()
+  if (jsonText.startsWith("```json")) jsonText = jsonText.slice(7)
+  else if (jsonText.startsWith("```")) jsonText = jsonText.slice(3)
+  if (jsonText.endsWith("```")) jsonText = jsonText.slice(0, -3)
+  jsonText = sanitizeJson(jsonText.trim())
+  return JSON.parse(jsonText)
+}
+
+function buildDocumentParts(
+  content: { text?: string; base64?: string; mimeType?: string }
+): Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> {
+  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = []
+  
+  if (content.base64 && content.mimeType) {
+    parts.push({
+      inlineData: {
+        mimeType: content.mimeType,
+        data: content.base64,
+      },
+    })
+  } else if (content.text) {
+    parts.push({ text: content.text })
+  }
+  
+  return parts
+}
+
+// Pass 1: Get clause outline
+async function getClauseOutline(
+  content: { text?: string; base64?: string; mimeType?: string }
+): Promise<{ outline: ClauseOutline[]; documentTitle: string }> {
+  console.log(`[v0] Pass 1: Getting clause outline...`)
+
+  const documentParts = buildDocumentParts(content)
+  const parts = [
+    { text: `${systemPrompt}\n\n${outlinePrompt}\n\n--- DOCUMENT START ---` },
+    ...documentParts,
+    { text: "--- DOCUMENT END ---" },
   ]
 
-  let currentSection: { number: string; title: string; content: string[] } | null = null
-  let sectionCount = 0
-
-  for (const line of lines) {
-    let matched = false
-
-    for (const pattern of sectionPatterns) {
-      const match = line.match(pattern)
-      if (match) {
-        // Save previous section
-        if (currentSection && currentSection.content.length > 0) {
-          sectionCount++
-          clauses.push(createClause(currentSection, sectionCount))
-        }
-
-        currentSection = {
-          number: match[1],
-          title: match[2] || `Section ${match[1]}`,
-          content: [],
-        }
-        matched = true
-        break
-      }
-    }
-
-    if (!matched && currentSection) {
-      currentSection.content.push(line)
-    } else if (!matched && !currentSection && line.length > 20) {
-      // Start capturing content even without a section header
-      currentSection = {
-        number: "1",
-        title: "Document Content",
-        content: [line],
-      }
-    }
-  }
-
-  // Save last section
-  if (currentSection && currentSection.content.length > 0) {
-    sectionCount++
-    clauses.push(createClause(currentSection, sectionCount))
-  }
-
-  // If no sections were found, create one from the entire document
-  if (clauses.length === 0) {
-    clauses.push({
-      id: "clause-1",
-      clauseNumber: "§ 1",
-      title: filename.replace(/\.[^/.]+$/, ""),
-      humanTitle: "Document Content",
-      subtitle: "Main document content",
-      originalText: text.substring(0, 2000),
-      plainMeaning:
-        "This document contains the terms and conditions as outlined in the text. Review each section carefully to understand your rights and obligations.",
-      whyMatters: [
-        "Understanding the full document helps you know what you are agreeing to",
-        "Key terms and conditions affect your rights",
-        "Being informed helps you make better decisions",
-      ],
-      riskLevel: "medium",
-      favors: "Neutral",
-      commonness: "Standard",
-      definitions: [],
-      questions: [
-        {
-          question: "What is this document about?",
-          answer:
-            "This document outlines specific terms, conditions, or agreements that the parties involved need to understand and follow.",
-          clauseReference: "§ 1",
-        },
-      ],
-    })
-  }
-
-  return clauses
-}
-
-function createClause(section: { number: string; title: string; content: string[] }, index: number) {
-  const originalText = section.content.join("\n").trim()
-  const wordCount = originalText.split(/\s+/).length
-
-  // Determine risk level based on keywords
-  const highRiskKeywords = ["indemnify", "liability", "termination", "breach", "damages", "waive", "forfeit", "penalty"]
-  const mediumRiskKeywords = ["obligation", "requirement", "must", "shall", "warranty", "guarantee", "limitation"]
-
-  const textLower = originalText.toLowerCase()
-  let riskLevel = "low"
-  let riskScore = 0
-
-  highRiskKeywords.forEach((keyword) => {
-    if (textLower.includes(keyword)) riskScore += 2
-  })
-  mediumRiskKeywords.forEach((keyword) => {
-    if (textLower.includes(keyword)) riskScore += 1
+  const response = await genAI.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [{ role: "user", parts }],
+    config: {
+      responseMimeType: "application/json",
+      maxOutputTokens: 4000,
+    },
   })
 
-  if (riskScore >= 4) riskLevel = "high"
-  else if (riskScore >= 2) riskLevel = "medium"
+  const responseText = response.text
+  if (!responseText) throw new Error("No content in outline response")
 
-  // Determine who the clause favors
-  let favors = "Neutral"
-  if (textLower.includes("licensor") || textLower.includes("company") || textLower.includes("employer")) {
-    favors = textLower.includes("licensor") ? "Licensor" : textLower.includes("employer") ? "Employer" : "Provider"
-  } else if (textLower.includes("licensee") || textLower.includes("user") || textLower.includes("employee")) {
-    favors = textLower.includes("licensee") ? "Licensee" : textLower.includes("employee") ? "Employee" : "User"
-  }
+  console.log(`[v0] Pass 1: Response length: ${responseText.length} chars`)
 
-  // Create human-readable title
-  const humanTitle =
-    section.title
-      .replace(/[^a-zA-Z\s]/g, "")
-      .split(" ")
-      .slice(0, 4)
-      .join(" ")
-      .trim() || `Section ${index}`
-
-  // Generate plain meaning
-  const plainMeaning = generatePlainMeaning(section.title, originalText, riskLevel)
-
-  // Generate why it matters
-  const whyMatters = generateWhyMatters(section.title, riskLevel)
-
-  // Extract definitions if any
-  const definitions = extractDefinitions(originalText)
-
-  return {
-    id: `clause-${index}`,
-    clauseNumber: `§ ${section.number}`,
-    title: section.title,
-    humanTitle,
-    subtitle: `${wordCount} words • ${riskLevel} risk`,
-    originalText: originalText.substring(0, 3000),
-    plainMeaning,
-    whyMatters,
-    riskLevel,
-    favors,
-    commonness: riskLevel === "high" ? "Aggressive" : riskLevel === "medium" ? "Standard" : "Favorable",
-    definitions,
-    questions: [
-      {
-        question: `What does the ${humanTitle} section mean for me?`,
-        answer: plainMeaning,
-        clauseReference: `§ ${section.number}`,
-      },
-      {
-        question: "Is this section standard in similar agreements?",
-        answer:
-          riskLevel === "high"
-            ? "This section contains terms that may be more aggressive than typical agreements. Consider reviewing carefully."
-            : "This section contains fairly standard language found in similar agreements.",
-        clauseReference: `§ ${section.number}`,
-      },
-    ],
-  }
-}
-
-function generatePlainMeaning(title: string, text: string, riskLevel: string): string {
-  const titleLower = title.toLowerCase()
-  const textLower = text.toLowerCase()
-
-  if (titleLower.includes("definition") || titleLower.includes("interpret")) {
-    return "This section explains the specific meanings of key terms used throughout the document. Understanding these definitions is crucial as they affect how the entire agreement is interpreted."
-  }
-  if (titleLower.includes("grant") || titleLower.includes("license")) {
-    return "This section describes what rights or permissions are being given, including any limitations on how those rights can be used."
-  }
-  if (titleLower.includes("payment") || titleLower.includes("fee") || textLower.includes("payment")) {
-    return "This section outlines the financial obligations, including amounts due, payment schedules, and any consequences for late or missed payments."
-  }
-  if (titleLower.includes("termination") || titleLower.includes("cancel")) {
-    return "This section explains how and when the agreement can be ended, what happens when it ends, and any obligations that continue after termination."
-  }
-  if (titleLower.includes("liability") || titleLower.includes("indemnif")) {
-    return "This section addresses who is responsible if something goes wrong, including limits on damages and obligations to protect the other party from claims."
-  }
-  if (titleLower.includes("confidential") || titleLower.includes("privacy")) {
-    return "This section covers what information must be kept private, how it can be used, and what happens if confidentiality is breached."
-  }
-  if (titleLower.includes("warrant") || titleLower.includes("guarantee")) {
-    return "This section describes what promises or guarantees are being made about the product or service, and importantly, what is NOT being guaranteed."
-  }
-
-  return riskLevel === "high"
-    ? "This section contains important terms that significantly affect your rights and obligations. Review it carefully and consider seeking clarification on any unclear points."
-    : "This section establishes standard terms for this type of agreement. While routine, it is still important to understand what you are agreeing to."
-}
-
-function generateWhyMatters(title: string, riskLevel: string): string[] {
-  const matters = []
-
-  if (riskLevel === "high") {
-    matters.push("Contains terms that could significantly impact your rights")
-    matters.push("May include obligations that are difficult to reverse")
-    matters.push("Worth discussing with legal counsel if unclear")
-  } else if (riskLevel === "medium") {
-    matters.push("Establishes important obligations you need to follow")
-    matters.push("Affects how you can use or interact with the subject matter")
-    matters.push("Understanding this helps avoid unintentional breaches")
+  const parsed = parseJsonResponse(responseText)
+  
+  let outline: ClauseOutline[]
+  if (Array.isArray(parsed)) {
+    outline = parsed as ClauseOutline[]
+  } else if (typeof parsed === 'object' && parsed !== null && 'clauses' in parsed) {
+    outline = (parsed as { clauses: ClauseOutline[] }).clauses
   } else {
-    matters.push("Provides helpful context for the agreement")
-    matters.push("Contains standard terms typical for this type of document")
-    matters.push("Ensures both parties have clear expectations")
+    throw new Error("Invalid outline format")
   }
 
-  return matters
-}
-
-function extractDefinitions(text: string): any[] {
-  const definitions: any[] = []
-
-  // Look for patterns like "Term" means or 'Term' means
-  const defPattern = /["']([^"']+)["']\s+(?:means?|refers?\s+to|shall\s+mean)/gi
-  let match
-
-  while ((match = defPattern.exec(text)) !== null && definitions.length < 5) {
-    definitions.push({
-      term: match[1],
-      plainMeaning: `The specific meaning of "${match[1]}" as used in this document.`,
-      example: `When you see "${match[1]}" in this agreement, it refers to the definition provided here.`,
-      importance: "Understanding this term helps interpret the entire document correctly.",
-    })
+  // Extract document title from first line if present
+  let documentTitle = ""
+  if (typeof parsed === 'object' && parsed !== null && 'document_title' in parsed) {
+    documentTitle = (parsed as { document_title: string }).document_title
   }
 
-  return definitions
+  // Validate minimum clause count
+  if (outline.length < 3) {
+    throw new Error("Document parsing returned too few clauses — possible parsing failure")
+  }
+
+  console.log(`[v0] Pass 1: Found ${outline.length} clauses`)
+  return { outline, documentTitle }
 }
 
-export async function POST(request: Request) {
+// Pass 2: Analyze a single clause
+async function analyzeClause(
+  clauseId: string,
+  clauseTitle: string,
+  clauseText: string,
+  clauseIndex: number,
+  totalClauses: number
+): Promise<Clause> {
+  console.log(`[v0] Analyzing clause ${clauseIndex + 1}/${totalClauses}: ${clauseTitle}`)
+
+  const prompt = `${systemPrompt}
+
+Analyze this single clause from a legal document and return a JSON object.
+
+Clause ID: ${clauseId}
+Clause Title: ${clauseTitle}
+Clause Text:
+${clauseText}
+
+${batchAnalysisPrompt}
+
+Return ONLY the JSON object directly. No markdown fences.`
+
+  const response = await genAI.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    config: {
+      responseMimeType: "application/json",
+      maxOutputTokens: 2000,
+    },
+  })
+
+  const responseText = response.text
+  if (!responseText) throw new Error(`No content for ${clauseId}`)
+
+  const parsed = parseJsonResponse(responseText) as Clause
+  if (!parsed.id) parsed.id = clauseId
+  if (!parsed.clauseNumber) parsed.clauseNumber = `§ ${clauseIndex + 1}`
+  return parsed
+}
+
+// Retry wrapper with timeout
+async function analyzeClauseWithRetry(
+  clauseId: string,
+  clauseTitle: string,
+  clauseText: string,
+  clauseIndex: number,
+  totalClauses: number,
+  maxRetries: number = 2
+): Promise<Clause> {
+  const TIMEOUT_MS = 25000
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[v0] Attempt ${attempt}/${maxRetries} for clause ${clauseId}`)
+      
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Clause analysis timeout")), TIMEOUT_MS)
+      )
+      
+      const result = await Promise.race([
+        analyzeClause(clauseId, clauseTitle, clauseText, clauseIndex, totalClauses),
+        timeoutPromise,
+      ])
+      
+      return result
+    } catch (error) {
+      if (attempt === maxRetries) throw error
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      console.warn(`[v0] Clause ${clauseId} attempt ${attempt} failed, retrying...`, errorMsg)
+      // Wait longer on rate limit errors
+      const delay = errorMsg.includes("429") || errorMsg.includes("quota") ? 10000 : 2000
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+  
+  throw new Error(`Failed to analyze clause ${clauseId} after ${maxRetries} attempts`)
+}
+
+export async function POST(request: NextRequest) {
+  console.log("[v0] POST /api/analyze-document: Starting streaming analysis...")
+
   try {
-    const { text, filename } = await request.json()
+    const ip = request.headers.get("x-forwarded-for") || "unknown"
+    const { success } = await ratelimit.limit(ip)
 
-    if (!text || text.trim().length === 0) {
-      return NextResponse.json({ error: "No text content provided" }, { status: 400 })
+    if (!success) {
+      return NextResponse.json({ error: "Rate limit exceeded. Maximum 10 analyses per hour." }, { status: 429 })
     }
 
-    // Parse document into sections using rule-based analysis
-    const clauses = parseDocumentIntoSections(text, filename)
+    const body = await request.json()
+    const { rawText, fileBase64, fileType, filename, documentId, fileSize } = body
 
-    // Generate a unique document ID
-    const documentId = `doc-${Date.now()}-${Math.random().toString(36).substring(7)}`
+    if (!rawText && !fileBase64) {
+      return NextResponse.json({ error: "No document content provided" }, { status: 400 })
+    }
 
-    return NextResponse.json({
-      documentId,
-      filename,
-      clauses,
-      analyzedAt: new Date().toISOString(),
+    if (fileSize && fileSize > MAX_FILE_SIZE) {
+      return NextResponse.json({
+        error: "This document is too large for a free analysis. Upload a shorter document or upgrade to Howard Pro for full analysis of large documents."
+      }, { status: 413 })
+    }
+
+    if (rawText) {
+      const wordCount = countWords(rawText)
+      if (wordCount > MAX_WORDS) {
+        return NextResponse.json({
+          error: "This document is too large for a free analysis. Upload a shorter document or upgrade to Howard Pro for full analysis of large documents."
+        }, { status: 413 })
+      }
+    }
+
+    const extractedTitle = extractDocumentTitle(rawText || "")
+
+    // Build content object
+    const content: { text?: string; base64?: string; mimeType?: string } = {}
+    if (fileBase64 && fileType) {
+      content.base64 = fileBase64
+      content.mimeType = fileType
+    } else {
+      content.text = rawText
+    }
+
+    // Create streaming response
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder()
+        
+        try {
+          // Pass 1: Get clause outline
+          const { outline, documentTitle } = await getClauseOutline(content)
+          const finalTitle = documentTitle || extractedTitle || filename
+
+          // Send initial metadata
+          const metadata = {
+            type: "metadata",
+            documentId,
+            filename,
+            document_title: finalTitle,
+            totalClauses: outline.length,
+            analyzedAt: new Date().toISOString(),
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`))
+
+          // Pass 2: Analyze clauses sequentially with delay to respect rate limits
+          // Gemini free tier: ~20 requests/minute, so we use 2 concurrent + 3s delay
+          const limit = createLimiter(2)
+          console.log(`[v0] Starting analysis of ${outline.length} clauses with concurrency 2 + rate limit delay`)
+
+          const tasks = outline.map((clause, index) =>
+            limit(async () => {
+              // Add 3-second delay between clause starts to stay under rate limit
+              if (index > 0) {
+                await new Promise(resolve => setTimeout(resolve, 3000))
+              }
+              try {
+                const result = await analyzeClauseWithRetry(
+                  clause.id,
+                  clause.title,
+                  clause.text || clause.title,
+                  index,
+                  outline.length
+                )
+                try {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause", clause: result })}\n\n`))
+                } catch {}
+              } catch (err) {
+                console.error(`[v0] Clause ${clause.id} failed:`, err)
+                try {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause_error", clauseId: clause.id })}\n\n`))
+                } catch {}
+              }
+            })
+          )
+
+          await Promise.all(tasks)
+          console.log(`[v0] All clauses analyzed`)
+
+          // Send completion signal
+          controller.enqueue(encoder.encode(`data: [DONE]\n\n`))
+          controller.close()
+        } catch (error) {
+          console.error("[v0] Streaming error:", error)
+          const errorData = {
+            type: "error",
+            error: error instanceof Error ? error.message : "Analysis failed",
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorData)}\n\n`))
+          controller.close()
+        }
+      },
+    })
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      },
     })
   } catch (error) {
-    console.error("Analysis error:", error)
-    return NextResponse.json({ error: "Failed to analyze document" }, { status: 500 })
+    console.error("[v0] Analysis error:", error)
+    let errorMessage = "Analysis failed"
+    let statusCode = 500
+    if (error instanceof Error) {
+      if (error.message.includes("rate limit") || error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
+        errorMessage = "API rate limit reached. Please try again in a few minutes."
+        statusCode = 429
+      } else if (error.message.includes("API key")) {
+        errorMessage = "AI service configuration error. Please contact support."
+        statusCode = 500
+      } else {
+        errorMessage = `Analysis failed: ${error.message}`
+      }
+    }
+    return NextResponse.json({ error: errorMessage }, { status: statusCode })
   }
 }

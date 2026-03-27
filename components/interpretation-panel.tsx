@@ -51,22 +51,74 @@ export function InterpretationPanel({ clause, totalClauses }: InterpretationPane
     })
   }
 
-  const handleAskHoward = () => {
-    if (!aiQuestion.trim()) return
+  const [isLoading, setIsLoading] = useState(false)
+
+  const handleAskHoward = async () => {
+    if (!aiQuestion.trim() || isLoading) return
 
     setAiMessages((prev) => [...prev, { role: "user", content: aiQuestion }])
+    setIsLoading(true)
+    const userQuestionTemp = aiQuestion
+    setAiQuestion("")
 
-    setTimeout(() => {
+    try {
+      const response = await fetch("/api/howard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: userQuestionTemp,
+          clauseText: clause.originalText,
+          clauseTitle: clause.title,
+          documentContext: clause.plainMeaning,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error("Failed to get response")
+      }
+
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error("No response body")
+
+      const decoder = new TextDecoder()
+      let assistantMessage = ""
+
+      setAiMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "" },
+      ])
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const chunk = decoder.decode(value, { stream: true })
+        assistantMessage += chunk
+
+        // Update the last message with streamed content
+        setAiMessages((prev) => {
+          const lastIdx = prev.length - 1
+          const newMessages = [...prev]
+          newMessages[lastIdx] = {
+            role: "assistant",
+            content: assistantMessage,
+          }
+          return newMessages
+        })
+      }
+    } catch (error) {
+      console.error("[v0] Howard error:", error)
       setAiMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: `Based on ${clause.clauseNumber} (${clause.title}), ${aiQuestion.toLowerCase().includes("risk") ? "the primary risk consideration is that " + clause.whyMatters[0]?.toLowerCase() : "this provision essentially establishes that " + clause.plainMeaning.toLowerCase()} For specific legal guidance, please consult with a qualified attorney.`,
+          content:
+            "Sorry, I encountered an error. Please try again. For legal guidance, please consult with a qualified attorney.",
         },
       ])
-    }, 800)
-
-    setAiQuestion("")
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   const clauseNumber = Number.parseInt(clause.clauseNumber.replace("§ ", ""))
@@ -358,10 +410,17 @@ export function InterpretationPanel({ clause, totalClauses }: InterpretationPane
                   />
                   <button
                     onClick={handleAskHoward}
-                    disabled={!aiQuestion.trim()}
+                    disabled={!aiQuestion.trim() || isLoading}
                     className="w-10 h-10 flex items-center justify-center rounded-xl bg-[var(--brand)] text-white hover:bg-[var(--brand)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-sm"
                   >
-                    <Send className="w-4 h-4" />
+                    {isLoading ? (
+                      <svg className="w-4 h-4 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                    ) : (
+                      <Send className="w-4 h-4" />
+                    )}
                   </button>
                 </div>
                 <p className="text-[10px] text-muted-foreground/50 mt-2 text-center">

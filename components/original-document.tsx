@@ -1,18 +1,31 @@
 "use client"
 
-import { useRef, useEffect } from "react"
+import { useRef, useEffect, useState } from "react"
 import { cn } from "@/lib/utils"
 import type { Clause } from "@/lib/legal-data"
+import ReactMarkdown from "react-markdown"
 
 interface OriginalDocumentProps {
   clauses: Clause[]
   activeClauseId: string | null
   onClauseSelect: (clauseId: string) => void
+  documentTitle?: string
 }
 
-export function OriginalDocument({ clauses, activeClauseId, onClauseSelect }: OriginalDocumentProps) {
+export function OriginalDocument({ clauses, activeClauseId, onClauseSelect, documentTitle }: OriginalDocumentProps) {
+  // Use state for date to avoid hydration mismatch
+  const [todayDate, setTodayDate] = useState<string>("")
   const containerRef = useRef<HTMLDivElement>(null)
   const clauseRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+
+  useEffect(() => {
+    // Set date on client side only to avoid hydration mismatch
+    setTodayDate(new Date().toLocaleDateString('en-US', { 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    }))
+  }, [])
 
   useEffect(() => {
     if (activeClauseId && clauseRefs.current.has(activeClauseId)) {
@@ -39,11 +52,11 @@ export function OriginalDocument({ clauses, activeClauseId, onClauseSelect }: Or
         {/* Document Header */}
         <header className="mb-8 md:mb-12 pb-6 md:pb-8 border-b border-highlight-border animate-fade-in">
           <h1 className="font-serif text-xl md:text-2xl text-paper-foreground mb-2 text-balance">
-            Software License Agreement
+            {documentTitle || "Document Review"}
           </h1>
           <div className="flex flex-wrap items-center gap-2 md:gap-3 mt-3">
             <p className="font-serif text-xs md:text-sm text-muted-foreground italic">
-              Effective Date: January 1, 2024
+              Effective Date: {todayDate}
             </p>
             <span className="px-2 py-0.5 text-[10px] font-medium tracking-wide bg-[var(--warning-bg)] text-[var(--warning)] border border-[var(--warning-border)] rounded-full">
               Under Review
@@ -95,8 +108,18 @@ export function OriginalDocument({ clauses, activeClauseId, onClauseSelect }: Or
                 </h2>
 
                 {/* Clause Text */}
-                <div className="font-serif text-xs md:text-sm text-paper-foreground/85 leading-[1.7] whitespace-pre-line">
-                  {clause.originalText}
+                <div className="font-serif text-xs md:text-sm text-paper-foreground/85 leading-[1.8] prose prose-sm max-w-none prose-p:my-2 prose-li:my-0.5 prose-ol:my-2 prose-ul:my-2 prose-strong:font-semibold prose-headings:font-serif">
+                  <ReactMarkdown
+                    components={{
+                      p: ({ children }) => <p className="mb-3">{children}</p>,
+                      strong: ({ children }) => <strong className="font-semibold text-paper-foreground">{children}</strong>,
+                      ol: ({ children }) => <ol className="list-decimal ml-4 space-y-1">{children}</ol>,
+                      ul: ({ children }) => <ul className="list-disc ml-4 space-y-1">{children}</ul>,
+                      li: ({ children }) => <li className="pl-1">{children}</li>,
+                    }}
+                  >
+                    {clause.originalText}
+                  </ReactMarkdown>
                 </div>
               </div>
             </article>

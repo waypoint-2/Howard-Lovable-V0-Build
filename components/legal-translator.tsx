@@ -17,12 +17,13 @@ interface LegalTranslatorProps {
   documentData?: {
     clauses: Clause[]
     filename: string
+    documentTitle?: string
   } | null
 }
 
 export function LegalTranslator({ documentData }: LegalTranslatorProps) {
   const clauses = documentData?.clauses?.length ? documentData.clauses : defaultClauses
-  const documentTitle = documentData?.filename || "Software License Agreement"
+  const documentTitle = documentData?.documentTitle || documentData?.filename || "Document Review"
 
   const [activeClauseId, setActiveClauseId] = useState<string | null>(clauses[0]?.id || "clause-1")
   const [documentLoaded, setDocumentLoaded] = useState(true)
@@ -84,7 +85,7 @@ export function LegalTranslator({ documentData }: LegalTranslatorProps) {
   return (
     <div className="flex flex-col h-[100dvh] bg-background">
       {/* Desktop Nav - hidden on mobile */}
-      <div className="hidden lg:block">
+      <div className="hidden lg:block relative z-50">
         <AppNav documentTitle={documentTitle} />
       </div>
 
@@ -145,6 +146,7 @@ export function LegalTranslator({ documentData }: LegalTranslatorProps) {
                   clauses={clauses}
                   activeClauseId={activeClauseId}
                   onClauseSelect={handleClauseSelect}
+                  documentTitle={documentTitle}
                 />
               </div>
               <div className="w-[420px] xl:w-[480px] shrink-0 border-l border-border">

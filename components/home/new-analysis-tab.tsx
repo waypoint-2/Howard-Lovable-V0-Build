@@ -18,6 +18,8 @@ export function NewAnalysisTab() {
   const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
+  const [fileInputKey, setFileInputKey] = useState(0)
+
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragging(true)
@@ -41,7 +43,9 @@ export function NewAnalysisTab() {
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
+    console.log("[v0] handleFileSelect fired, files:", files?.length)
     if (files && files.length > 0) {
+      console.log("[v0] File selected:", files[0].name, files[0].size)
       setUploadedFile(files[0])
       setUploadState("idle")
       setError(null)
@@ -51,16 +55,9 @@ export function NewAnalysisTab() {
   const handleBrowseClick = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
+    console.log("[v0] handleBrowseClick fired, fileInputRef:", fileInputRef.current)
     fileInputRef.current?.click()
   }, [])
-
-  const extractTextFromFile = async (file: File): Promise<string> => {
-    if (file.type === "text/plain" || file.name.endsWith(".txt")) {
-      return await file.text()
-    }
-    const text = await file.text()
-    return text
-  }
 
   const startAnalysis = async () => {
     if (!uploadedFile) return
@@ -75,7 +72,7 @@ export function NewAnalysisTab() {
         setProgress((prev) => Math.min(prev + 10, 40))
       }, 200)
 
-      // Upload file to Blob storage
+      // Upload file to Blob storage + extract text
       const formData = new FormData()
       formData.append("file", uploadedFile)
 
@@ -88,48 +85,115 @@ export function NewAnalysisTab() {
       setProgress(50)
 
       if (!uploadResponse.ok) {
-        throw new Error("Upload failed")
+        const errorData = await uploadResponse.json()
+        throw new Error(errorData.error || "Upload failed")
       }
+
+      const uploadResult = await uploadResponse.json()
+      const { rawText, fileBase64, fileType, documentId } = uploadResult
 
       setUploadState("analyzing")
 
-      // Extract text and analyze with AI
-      const text = await extractTextFromFile(uploadedFile)
-
-      const analysisInterval = setInterval(() => {
-        setProgress((prev) => Math.min(prev + 5, 90))
-      }, 300)
-
+      // Analyze with AI using Server-Sent Events
       const analyzeResponse = await fetch("/api/analyze-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, filename: uploadedFile.name }),
+        body: JSON.stringify({ 
+          rawText, 
+          fileBase64,
+          fileType,
+          filename: uploadedFile.name, 
+          documentId 
+        }),
       })
-
-      clearInterval(analysisInterval)
-      setProgress(100)
 
       if (!analyzeResponse.ok) {
         const errorData = await analyzeResponse.json()
         throw new Error(errorData.error || "Analysis failed")
       }
 
-      const result = await analyzeResponse.json()
+      // Initialize storage for streaming results
+      let allClauses: any[] = []
+      let documentTitle = ""
+      let totalClauses = 0
 
-      sessionStorage.setItem(
-        "analyzedDocument",
-        JSON.stringify({
-          clauses: result.clauses,
-          filename: result.filename,
-          documentId: result.documentId,
-          analyzedAt: result.analyzedAt,
-        }),
-      )
+      // Read SSE stream
+      const reader = analyzeResponse.body?.getReader()
+      if (!reader) throw new Error("No response body")
 
-      setUploadState("complete")
+      const decoder = new TextDecoder()
+      let buffer = ""
 
-      // Redirect to the document review page
-      router.push("/review")
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || "" // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6).trim()
+            
+            if (data === "[DONE]") {
+              // Store final result and redirect
+              sessionStorage.setItem(
+                "analyzedDocument",
+                JSON.stringify({
+                  document_title: documentTitle,
+                  clauses: allClauses,
+                  filename: uploadedFile.name,
+                  documentId,
+                  analyzedAt: new Date().toISOString(),
+                }),
+              )
+              setProgress(100)
+              setUploadState("complete")
+              router.push("/review")
+              return
+            }
+
+            try {
+              const parsed = JSON.parse(data)
+              
+              // Handle metadata event (pass 1 complete)
+              if (parsed.type === "metadata") {
+                totalClauses = parsed.totalClauses || 0
+                documentTitle = parsed.document_title || ""
+                console.log(`[v0] Received metadata: ${totalClauses} clauses`)
+              }
+              
+              // Handle individual clause event (pass 2 - new parallel format)
+              if (parsed.type === "clause" && parsed.clause) {
+                allClauses.push(parsed.clause)
+                const progressPercent = totalClauses > 0 
+                  ? Math.min(50 + Math.floor((allClauses.length / totalClauses) * 50), 99)
+                  : 50 + allClauses.length * 5
+                setProgress(progressPercent)
+                console.log(`[v0] Received clause: ${parsed.clause.id}, total: ${allClauses.length}`)
+              }
+              
+              // Handle batch event (fallback for older format)
+              if (parsed.type === "batch" && parsed.clauses) {
+                allClauses = [...allClauses, ...parsed.clauses]
+                const progressPercent = totalClauses > 0 
+                  ? Math.min(50 + Math.floor((allClauses.length / totalClauses) * 50), 99)
+                  : 50 + allClauses.length * 5
+                setProgress(progressPercent)
+                console.log(`[v0] Received batch: ${parsed.clauses.length} clauses, total: ${allClauses.length}`)
+              }
+              
+              // Handle error event
+              if (parsed.type === "error") {
+                throw new Error(parsed.message || "Analysis failed")
+              }
+            } catch (parseError) {
+              console.error("[v0] Failed to parse SSE data:", data)
+            }
+          }
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong")
       setUploadState("error")
@@ -141,7 +205,15 @@ export function NewAnalysisTab() {
     setUploadState("idle")
     setProgress(0)
     setError(null)
+    setFileInputKey((k) => k + 1) // reset input so same file can be re-selected
   }
+
+  const handleAreaClick = useCallback((e: React.MouseEvent) => {
+    // Only trigger if not clicking a button inside the area
+    if ((e.target as HTMLElement).closest('button')) return
+    if (uploadState === "uploading" || uploadState === "analyzing") return
+    fileInputRef.current?.click()
+  }, [uploadState])
 
   return (
     <div className="flex flex-col items-center">
@@ -150,20 +222,22 @@ export function NewAnalysisTab() {
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
+        onClick={handleAreaClick}
         className={cn(
           "w-full max-w-2xl relative rounded-2xl border-2 border-dashed transition-all duration-300",
           "bg-card/50 hover:bg-card",
           uploadState === "uploading" || uploadState === "analyzing"
-            ? "border-[var(--brand)] bg-[var(--brand-light)]"
+            ? "border-[var(--brand)] bg-[var(--brand-light)] cursor-default"
             : isDragging
-              ? "border-[var(--brand)] bg-[var(--brand-light)] scale-[1.02]"
+              ? "border-[var(--brand)] bg-[var(--brand-light)] scale-[1.02] cursor-copy"
               : uploadState === "error"
-                ? "border-[var(--risk-high)] bg-[var(--risk-high-bg)]"
-                : "border-border/60 hover:border-border",
+                ? "border-[var(--risk-high)] bg-[var(--risk-high-bg)] cursor-pointer"
+                : "border-border/60 hover:border-border cursor-pointer",
         )}
       >
         <div className="flex flex-col items-center justify-center py-16 md:py-20">
           <input
+            key={fileInputKey}
             ref={fileInputRef}
             type="file"
             className="hidden"
