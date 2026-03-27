@@ -85,16 +85,17 @@ interface Clause {
 
 const systemPrompt = `You are Howard, a legal document analyst. Analyze legal documents clause by clause and return structured JSON helping non-lawyers understand what they are signing. Be precise and plain-spoken. Conservative on risk. Return valid JSON only. No preamble, no markdown fences, just the JSON.`
 
-const outlinePrompt = `You are analyzing a legal document. Your job is to identify EVERY clause, section, and article in this document — do not skip any.
+const outlinePrompt = `You are analyzing a legal document. Identify EVERY clause, section, and article — do not skip any.
 
 Return a JSON array where each element has:
 - id: "clause-N" (sequential, starting at clause-1)
 - title: the exact heading or section title from the document
+- text: the full text content of that clause/section (everything under that heading until the next heading)
 
 Rules:
 - Include ALL numbered sections, articles, and clauses — even short ones
 - Include subsections if they have distinct headings
-- If a section has no heading, use its first 5 words as the title
+- Capture the complete text of each clause in the "text" field
 - Aim to find at least 8–20 clauses for a typical legal document
 - Do NOT merge sections together
 
@@ -227,24 +228,30 @@ async function getClauseOutline(
 
 // Pass 2: Analyze a single clause
 async function analyzeClause(
-  content: { text?: string; base64?: string; mimeType?: string },
-  clause: ClauseOutline,
-  outline: ClauseOutline[],
-  clauseIndex: number
+  clauseId: string,
+  clauseTitle: string,
+  clauseText: string,
+  clauseIndex: number,
+  totalClauses: number
 ): Promise<Clause> {
-  const clauseNumber = clauseIndex + 1
-  console.log(`[v0] Pass 2: Analyzing clause ${clauseNumber}/${outline.length}: ${clause.title}`)
+  console.log(`[v0] Analyzing clause ${clauseIndex + 1}/${totalClauses}: ${clauseTitle}`)
 
-  const documentParts = buildDocumentParts(content)
-  const parts = [
-    { text: `${systemPrompt}\n\n${batchAnalysisPrompt}\n\nClause ID: ${clause.id}\nClause Title: ${clause.title}\n\n--- DOCUMENT START ---` },
-    ...documentParts,
-    { text: "--- DOCUMENT END ---\n\nBe concise. Return ONLY valid JSON object. No markdown fences." },
-  ]
+  const prompt = `${systemPrompt}
+
+Analyze this single clause from a legal document and return a JSON object.
+
+Clause ID: ${clauseId}
+Clause Title: ${clauseTitle}
+Clause Text:
+${clauseText}
+
+${batchAnalysisPrompt}
+
+Return ONLY the JSON object directly. No markdown fences.`
 
   const response = await genAI.models.generateContent({
     model: "gemini-2.5-flash",
-    contents: [{ role: "user", parts }],
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
     config: {
       responseMimeType: "application/json",
       maxOutputTokens: 2000,
@@ -252,49 +259,47 @@ async function analyzeClause(
   })
 
   const responseText = response.text
-  if (!responseText) throw new Error(`No content in clause response for ${clause.id}`)
-
-  console.log(`[v0] Pass 2: Clause ${clauseNumber} response length: ${responseText.length} chars`)
+  if (!responseText) throw new Error(`No content for ${clauseId}`)
 
   const parsed = parseJsonResponse(responseText) as Clause
-  if (!parsed.id) parsed.id = clause.id
-  if (!parsed.clauseNumber) parsed.clauseNumber = `§ ${clauseNumber}`
-  
+  if (!parsed.id) parsed.id = clauseId
+  if (!parsed.clauseNumber) parsed.clauseNumber = `§ ${clauseIndex + 1}`
   return parsed
 }
 
 // Retry wrapper with timeout
 async function analyzeClauseWithRetry(
-  content: { text?: string; base64?: string; mimeType?: string },
-  clause: ClauseOutline,
-  outline: ClauseOutline[],
+  clauseId: string,
+  clauseTitle: string,
+  clauseText: string,
   clauseIndex: number,
+  totalClauses: number,
   maxRetries: number = 2
 ): Promise<Clause> {
-  const TIMEOUT_MS = 10000
+  const TIMEOUT_MS = 25000
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`[v0] Attempt ${attempt}/${maxRetries} for clause ${clause.id}`)
+      console.log(`[v0] Attempt ${attempt}/${maxRetries} for clause ${clauseId}`)
       
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Clause analysis timeout")), TIMEOUT_MS)
       )
       
       const result = await Promise.race([
-        analyzeClause(content, clause, outline, clauseIndex),
+        analyzeClause(clauseId, clauseTitle, clauseText, clauseIndex, totalClauses),
         timeoutPromise,
       ])
       
       return result
     } catch (error) {
       if (attempt === maxRetries) throw error
-      console.warn(`[v0] Clause ${clause.id} attempt ${attempt} failed, retrying...`, error instanceof Error ? error.message : error)
+      console.warn(`[v0] Clause ${clauseId} attempt ${attempt} failed, retrying...`, error instanceof Error ? error.message : error)
       await new Promise(resolve => setTimeout(resolve, 1000)) // Wait before retry
     }
   }
   
-  throw new Error(`Failed to analyze clause ${clause.id} after ${maxRetries} attempts`)
+  throw new Error(`Failed to analyze clause ${clauseId} after ${maxRetries} attempts`)
 }
 
 export async function POST(request: NextRequest) {
@@ -369,19 +374,21 @@ export async function POST(request: NextRequest) {
           const tasks = outline.map((clause, index) =>
             limit(async () => {
               try {
-                const result = await analyzeClauseWithRetry(content, clause, outline, index)
+                const result = await analyzeClauseWithRetry(
+                  clause.id,
+                  clause.title,
+                  clause.text || clause.title,
+                  index,
+                  outline.length
+                )
                 try {
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause", clause: result })}\n\n`))
-                } catch (streamError) {
-                  console.error(`[v0] Stream error sending clause ${clause.id}:`, streamError)
-                }
+                } catch {}
               } catch (err) {
-                console.error(`[v0] Clause ${clause.id} analysis failed:`, err)
+                console.error(`[v0] Clause ${clause.id} failed:`, err)
                 try {
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause_error", clauseId: clause.id })}\n\n`))
-                } catch (streamError) {
-                  console.error(`[v0] Stream error sending clause error for ${clause.id}:`, streamError)
-                }
+                } catch {}
               }
             })
           )
