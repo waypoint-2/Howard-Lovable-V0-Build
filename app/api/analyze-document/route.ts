@@ -62,6 +62,7 @@ function countWords(text: string): number {
 interface ClauseOutline {
   id: string
   title: string
+  text?: string
 }
 
 interface Clause {
