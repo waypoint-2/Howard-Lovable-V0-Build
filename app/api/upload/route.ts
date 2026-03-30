@@ -90,12 +90,12 @@ export async function POST(request: NextRequest) {
           .from("documents")
           .insert({
             user_id: user.id,
-            filename: file.name,
+            file_name: file.name,
             blob_url: blob.url,
             raw_text: rawText || null,
             file_size: file.size,
             file_type: file.type,
-            upload_status: "success",
+            status: "uploaded",
           })
           .select()
           .single()

@@ -90,7 +90,7 @@ export function NewAnalysisTab() {
       }
 
       const uploadResult = await uploadResponse.json()
-      const { rawText, fileBase64, fileType, documentId } = uploadResult
+      const { rawText, fileBase64, fileType, documentId, url: blobUrl } = uploadResult
 
       setUploadState("analyzing")
 
@@ -137,6 +137,28 @@ export function NewAnalysisTab() {
             const data = line.slice(6).trim()
             
             if (data === "[DONE]") {
+              // Persist to Supabase (best-effort — fails gracefully if user not logged in)
+              let analysisId: string | null = null
+              try {
+                const saveResponse = await fetch("/api/save-analysis", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    documentId,
+                    blobUrl,
+                    filename: uploadedFile.name,
+                    documentTitle,
+                    clauses: allClauses,
+                  }),
+                })
+                if (saveResponse.ok) {
+                  const saveResult = await saveResponse.json()
+                  if (saveResult.persisted) analysisId = saveResult.analysisId
+                }
+              } catch (saveErr) {
+                console.warn("[v0] Could not persist analysis to Supabase:", saveErr)
+              }
+
               // Store final result and redirect
               sessionStorage.setItem(
                 "analyzedDocument",
@@ -145,6 +167,7 @@ export function NewAnalysisTab() {
                   clauses: allClauses,
                   filename: uploadedFile.name,
                   documentId,
+                  analysisId,
                   analyzedAt: new Date().toISOString(),
                 }),
               )

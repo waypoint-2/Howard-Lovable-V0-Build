@@ -3,17 +3,18 @@
 import Link from "next/link"
 import { FileText, Clock, ArrowUpRight, Shield, AlertTriangle, CheckCircle, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { useState } from "react"
+import { useState, useEffect } from "react"
+import { createClient } from "@/lib/supabase/client"
 
 interface Document {
   id: string
   filename: string
   created_at: string
-  analysis?: {
+  analysis?: Array<{
     overall_risk: "low" | "medium" | "high"
     status: string
     clauses: Array<{ id: string }>
-  }
+  }>
 }
 
 const riskConfig = {
@@ -24,10 +25,58 @@ const riskConfig = {
 
 export function RecentTab() {
   const [documents, setDocuments] = useState<Document[]>([])
-  const [isLoading, setIsLoading] = useState(false)
-  
-  // For now, show empty state since we're not using auth
-  // Documents are analyzed on-demand and stored in sessionStorage
+  const [isLoading, setIsLoading] = useState(true)
+
+  useEffect(() => {
+    const fetchDocuments = async () => {
+      try {
+        const supabase = createClient()
+        const {
+          data: { user },
+        } = await supabase.auth.getUser()
+
+        if (!user) {
+          setIsLoading(false)
+          return
+        }
+
+        const { data, error } = await supabase
+          .from("documents")
+          .select(`
+            id,
+            file_name,
+            created_at,
+            analyses (
+              id,
+              overall_risk,
+              status,
+              clauses ( id )
+            )
+          `)
+          .order("created_at", { ascending: false })
+          .limit(10)
+
+        if (error) {
+          console.error("[v0] recent-tab: failed to fetch documents:", error)
+        } else if (data) {
+          setDocuments(
+            data.map((doc) => ({
+              id: doc.id,
+              filename: doc.file_name,
+              created_at: doc.created_at,
+              analysis: doc.analyses as Document["analysis"],
+            }))
+          )
+        }
+      } catch (err) {
+        console.error("[v0] recent-tab: unexpected error:", err)
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchDocuments()
+  }, [])
 
   const formatDate = (dateString: string) => {
     const date = new Date(dateString)
