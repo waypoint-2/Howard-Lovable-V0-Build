@@ -39,7 +39,8 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
 
 const MAX_WORDS = 5000
 const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2MB
-const CONCURRENCY = 3
+const CONCURRENCY = 1            // Sequential to avoid Anthropic rate limits
+const INTER_CLAUSE_DELAY_MS = 800 // Breathing room between sequential Haiku calls
 
 function extractDocumentTitle(rawText: string): string {
   if (!rawText) return ""
@@ -276,6 +277,20 @@ Return ONLY the JSON object directly. No markdown fences.`
   return parsed
 }
 
+// Classify Anthropic errors for targeted logging
+function classifyError(error: unknown): { type: string; isRateLimit: boolean; isTimeout: boolean } {
+  const msg = error instanceof Error ? error.message : String(error)
+  const isRateLimit =
+    msg.includes("rate limit") ||
+    msg.includes("429") ||
+    msg.includes("too many requests") ||
+    (error instanceof Error && error.name === "RateLimitError")
+  const isTimeout = msg.includes("timeout") || msg.includes("ETIMEDOUT") || msg.includes("abort")
+  const isOverloaded = msg.includes("overloaded") || msg.includes("529") || msg.includes("503")
+  const type = isRateLimit ? "RATE_LIMIT" : isTimeout ? "TIMEOUT" : isOverloaded ? "OVERLOADED" : "API_ERROR"
+  return { type, isRateLimit, isTimeout }
+}
+
 // Retry wrapper with timeout
 async function analyzeClauseWithRetry(
   clauseId: string,
@@ -285,11 +300,13 @@ async function analyzeClauseWithRetry(
   totalClauses: number,
   maxRetries: number = 3
 ): Promise<Clause> {
-  const TIMEOUT_MS = 25000
+  const TIMEOUT_MS = 20000 // Reduced from 25s so retries fit within the function's 60s budget
+  const clauseStart = Date.now()
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const attemptStart = Date.now()
     try {
-      console.log(`[v0] Attempt ${attempt}/${maxRetries} for clause ${clauseId}`)
+      console.log(`[v0] Clause ${clauseId} (${clauseIndex + 1}/${totalClauses}) attempt ${attempt}/${maxRetries} starting`)
 
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Clause analysis timeout")), TIMEOUT_MS)
@@ -300,13 +317,31 @@ async function analyzeClauseWithRetry(
         timeoutPromise,
       ])
 
+      const elapsed = Date.now() - clauseStart
+      console.log(`[v0] Clause ${clauseId} succeeded on attempt ${attempt} in ${elapsed}ms`)
       return result
     } catch (error) {
-      if (attempt === maxRetries) throw error
-      const errorMsg = error instanceof Error ? error.message : String(error)
-      console.warn(`[v0] Clause ${clauseId} attempt ${attempt} failed, retrying...`, errorMsg)
-      // Exponential backoff: 2s, 4s
-      await new Promise(resolve => setTimeout(resolve, 2000 * attempt))
+      const { type, isRateLimit } = classifyError(error)
+      const attemptMs = Date.now() - attemptStart
+      const totalMs = Date.now() - clauseStart
+      const msg = error instanceof Error ? error.message : String(error)
+
+      if (attempt === maxRetries) {
+        console.error(
+          `[v0] Clause ${clauseId} FAILED permanently after ${maxRetries} attempts (${totalMs}ms total). ` +
+          `Error type: ${type}. Last error: ${msg}`
+        )
+        throw error
+      }
+
+      // Backoff: 4s after attempt 1, 8s after attempt 2 (longer than before to clear rate limits)
+      const delayMs = 4000 * attempt
+      console.warn(
+        `[v0] Clause ${clauseId} attempt ${attempt} failed in ${attemptMs}ms. ` +
+        `Error type: ${type}. Message: ${msg}. ` +
+        `Retrying in ${delayMs / 1000}s... (isRateLimit=${isRateLimit})`
+      )
+      await new Promise(resolve => setTimeout(resolve, delayMs))
     }
   }
 
@@ -383,6 +418,10 @@ export async function POST(request: NextRequest) {
 
           const tasks = outline.map((clause, index) =>
             limit(async () => {
+              // Stagger sequential Haiku calls to avoid rate limit bursts
+              if (index > 0) {
+                await new Promise(resolve => setTimeout(resolve, INTER_CLAUSE_DELAY_MS))
+              }
               try {
                 const result = await analyzeClauseWithRetry(
                   clause.id,
@@ -395,9 +434,11 @@ export async function POST(request: NextRequest) {
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause", clause: result })}\n\n`))
                 } catch {}
               } catch (err) {
-                console.error(`[v0] Clause ${clause.id} failed:`, err)
+                const { type } = classifyError(err)
+                const msg = err instanceof Error ? err.message : String(err)
+                console.error(`[v0] Clause ${clause.id} permanently failed. Error type: ${type}. Message: ${msg}`)
                 try {
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause_error", clauseId: clause.id })}\n\n`))
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "clause_error", clauseId: clause.id, errorType: type })}\n\n`))
                 } catch {}
               }
             })
